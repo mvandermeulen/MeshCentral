@@ -707,7 +707,15 @@ module.exports.CreateAmtManager = function (parent) {
             dev.aquired.controlMode = responses['IPS_HostBasedSetupService'].response.CurrentControlMode; // 1 = CCM, 2 = ACM
             if (typeof stack.wsman.comm.amtVersion == 'string') { // Set the Intel AMT version using the HTTP header if present
                 var verSplit = stack.wsman.comm.amtVersion.split('.');
-                if (verSplit.length >= 3) { dev.aquired.version = verSplit[0] + '.' + verSplit[1] + '.' + verSplit[2]; dev.aquired.majorver = parseInt(verSplit[0]); dev.aquired.minorver = parseInt(verSplit[1]); }
+                if (verSplit.length >= 2) {
+                    dev.aquired.version = verSplit[0] + '.' + verSplit[1];
+                    dev.aquired.majorver = parseInt(verSplit[0]);
+                    dev.aquired.minorver = parseInt(verSplit[1]);
+                    if (verSplit.length >= 3) {
+                        dev.aquired.version = verSplit[0] + '.' + verSplit[1] + '.' + verSplit[2];
+                        dev.aquired.maintenancever = parseInt(verSplit[2]);
+                    }
+                }
             }
             dev.aquired.realm = stack.wsman.comm.digestRealm;
             dev.aquired.user = dev.intelamt.user = stack.wsman.comm.user;
@@ -750,7 +758,8 @@ module.exports.CreateAmtManager = function (parent) {
                                                 // Start power polling if not connected to LMS
                                                 var ppfunc = function powerPoleFunction() { fetchPowerState(powerPoleFunction.dev); }
                                                 ppfunc.dev = dev;
-                                                dev.polltimer = new setTimeout(ppfunc, 290000); // Poll for power state every 4 minutes 50 seconds.
+                                                if(dev.polltimer){ clearInterval(dev.polltimer); delete dev.polltimer; }
+                                                dev.polltimer = new setInterval(ppfunc, 290000); // Poll for power state every 4 minutes 50 seconds.
                                                 fetchPowerState(dev);
                                             } else {
                                                 // For LMS connections, close now.
@@ -930,8 +939,8 @@ module.exports.CreateAmtManager = function (parent) {
                     if (response.Body.OSPowerSavingState == 2) { meshPowerState = 1; } // Fully powered (S0);
                     else if (response.Body.OSPowerSavingState == 3) { meshPowerState = 2; } // Modern standby (We are going to call this S1);
 
-                    // Set OS power state
-                    if (meshPowerState >= 0) { parent.SetConnectivityState(dev.meshid, dev.nodeid, Date.now(), 4, meshPowerState, null, { name: dev.name }); }
+                    // Set OS power state - connType: 0 = CIRA, 1 = CIRA-Relay, 2 = CIRA-LMS, 3 = LAN
+                    if (meshPowerState >= 0) { parent.SetConnectivityState(dev.meshid, dev.nodeid, Date.now(), (dev.connType == 3 ? 4 : 2), meshPowerState, null, { name: dev.name }); }
                 });
             } else {
                 // Convert the power state
@@ -940,13 +949,13 @@ module.exports.CreateAmtManager = function (parent) {
                 var meshPowerState = -1, powerConversionTable = [-1, -1, 1, 2, 3, 6, 6, 5, 6];
                 if (powerstate < powerConversionTable.length) { meshPowerState = powerConversionTable[powerstate]; } else { powerstate = 6; }
 
-                // Set power state
-                if (meshPowerState >= 0) { parent.SetConnectivityState(dev.meshid, dev.nodeid, Date.now(), 4, meshPowerState, null, { name: dev.name }); }
+                // Set power state - connType: 0 = CIRA, 1 = CIRA-Relay, 2 = CIRA-LMS, 3 = LAN
+                if (meshPowerState >= 0) { parent.SetConnectivityState(dev.meshid, dev.nodeid, Date.now(), (dev.connType == 3 ? 4 : 2), meshPowerState, null, { name: dev.name }); }
             }
         });
     }
 
-    // Perform a power action: 2 = Power up, 5 = Power cycle, 8 = Power down, 10 = Reset, 11 = Power on to BIOS, 12 = Reset to BIOS, 13 = Power on to BIOS with SOL, 14 = Reset to BIOS with SOL
+    // Perform a power action: 2 = Power up, 5 = Power cycle, 8 = Power down, 10 = Reset, 11 = Power on to BIOS, 12 = Reset to BIOS, 13 = Power on to BIOS with SOL, 14 = Reset to BIOS with SOL, 15 = Power on to PXE, 16 = Reset to PXE
     function performPowerAction(nodeid, action) {
         console.log('performPowerAction', nodeid, action);
         var devices = obj.amtDevices[nodeid];
@@ -961,7 +970,7 @@ module.exports.CreateAmtManager = function (parent) {
                     // Action: 2 = Power up, 5 = Power cycle, 8 = Power down, 10 = Reset
                     try { dev.amtstack.RequestPowerStateChange(action, performPowerActionResponse); } catch (ex) { }
                 } else {
-                    // 11 = Power on to BIOS, 12 = Reset to BIOS, 13 = Power on to BIOS with SOL, 14 = Reset to BIOS with SOL
+                    // 11 = Power on to BIOS, 12 = Reset to BIOS, 13 = Power on to BIOS with SOL, 14 = Reset to BIOS with SOL, 15 = Power on to PXE, 16 = Reset to PXE
                     dev.amtstack.BatchEnum(null, ['*AMT_BootSettingData'], performAdvancedPowerActionResponse);
                 }
             }
@@ -994,8 +1003,8 @@ module.exports.CreateAmtManager = function (parent) {
         // Ready boot parameters
         bootSettingData['BIOSSetup'] = ((action >= 11) && (action <= 14));
         bootSettingData['UseSOL'] = ((action >= 13) && (action <= 14));
-        if ((action == 11) || (action == 13)) { dev.powerAction = 2; } // Power on
-        if ((action == 12) || (action == 14)) { dev.powerAction = 10; } // Reset
+        if ((action == 11) || (action == 13) || (action == 15)) { dev.powerAction = 2; } // Power on
+        if ((action == 12) || (action == 14) || (action == 16)) { dev.powerAction = 10; } // Reset
 
         // Set boot parameters
         dev.amtstack.Put('AMT_BootSettingData', bootSettingData, function (stack, name, response, status, tag) {
@@ -1006,7 +1015,8 @@ module.exports.CreateAmtManager = function (parent) {
                 const dev = stack.dev;
                 if ((obj.amtDevices[dev.nodeid] == null) || (status != 200)) return; // Device no longer exists or error
                 // Set boot order
-                dev.amtstack.CIM_BootConfigSetting_ChangeBootOrder(null, function (stack, name, response, status) {
+                var bootDevice = (action === 15 || action === 16) ? '<Address xmlns="http://schemas.xmlsoap.org/ws/2004/08/addressing">http://schemas.xmlsoap.org/ws/2004/08/addressing</Address><ReferenceParameters xmlns="http://schemas.xmlsoap.org/ws/2004/08/addressing"><ResourceURI xmlns="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd">http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_BootSourceSetting</ResourceURI><SelectorSet xmlns="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd"><Selector Name="InstanceID">Intel(r) AMT: Force PXE Boot</Selector></SelectorSet></ReferenceParameters>' : null;
+                dev.amtstack.CIM_BootConfigSetting_ChangeBootOrder(bootDevice, function (stack, name, response, status) {
                     const dev = stack.dev;
                     if ((obj.amtDevices[dev.nodeid] == null) || (status != 200)) return; // Device no longer exists or error
                     // Perform power action
@@ -1059,7 +1069,7 @@ module.exports.CreateAmtManager = function (parent) {
         if (status != 200) { dev.consoleMsg("Failed to get security information (" + status + ")."); delete dev.ocrfile; return; }
 
         // Check if this Intel AMT device supports OCR
-        if (responses['AMT_PublicKeyCertificate'].responses['ForceUEFIHTTPSBoot'] !== true) {
+        if (responses['AMT_BootCapabilities'].response['ForceUEFIHTTPSBoot'] !== true) {
             dev.consoleMsg("This Intel AMT device does not support UEFI HTTPS boot  (" + status + ")."); delete dev.ocrfile; return;
         }
 
@@ -1089,11 +1099,14 @@ module.exports.CreateAmtManager = function (parent) {
 
         // Generate the one-time URL.
         var cookie = obj.parent.encodeCookie({ a: 'f', f: dev.ocrfile }, obj.parent.loginCookieEncryptionKey)
-        var url = 'https://' + parent.webserver.certificates.AmtMpsName + ':' + ((parent.args.mpsaliasport != null) ? parent.args.mpsaliasport : parent.args.mpsport) + '/c/' + cookie + '.iso';
+        var url = 'https://' + parent.webserver.certificates.AmtMpsName + ':' + ((parent.args.mpsaliasport != null) ? parent.args.mpsaliasport : parent.args.mpsport) + '/c/' + cookie + '.efi';
         delete dev.ocrfile;
 
         // Generate the boot data for OCR with URL
         var r = response.Body;
+        r['BIOSPause'] = false;
+        r['BIOSSetup'] = false;
+        r['EnforceSecureBoot'] = false;
         r['UefiBootParametersArray'] = Buffer.from(makeUefiBootParam(1, url) + makeUefiBootParam(20, 1, 1) + makeUefiBootParam(30, 0, 2), 'binary').toString('base64');
         r['UefiBootNumberOfParams'] = 3;
         r['BootMediaIndex'] = 0; // Do not use boot media index for One Click Recovery (OCR)
@@ -1114,8 +1127,7 @@ module.exports.CreateAmtManager = function (parent) {
         dev.amtstack.SetBootConfigRole(1, function (stack, name, response, status) {
             if (isAmtDeviceValid(dev) == false) return; // Device no longer exists, ignore this request.
             if (status != 200) { dev.consoleMsg("Failed to set boot config role (" + status + ")."); return; }
-            var bootSource = 'Force OCR UEFI HTTPS Boot';
-            dev.amtstack.CIM_BootConfigSetting_ChangeBootOrder((bootSource == null) ? bootSource : '<Address xmlns="http://schemas.xmlsoap.org/ws/2004/08/addressing">http://schemas.xmlsoap.org/ws/2004/08/addressing</Address><ReferenceParameters xmlns="http://schemas.xmlsoap.org/ws/2004/08/addressing"><ResourceURI xmlns="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd">http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_BootSourceSetting</ResourceURI><SelectorSet xmlns="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd"><Selector Name="InstanceID">Intel(r) AMT: ' + bootSource + '</Selector></SelectorSet></ReferenceParameters>', function (stack, name, response, status) {
+            dev.amtstack.CIM_BootConfigSetting_ChangeBootOrder('<Address xmlns="http://schemas.xmlsoap.org/ws/2004/08/addressing">http://schemas.xmlsoap.org/ws/2004/08/addressing</Address><ReferenceParameters xmlns="http://schemas.xmlsoap.org/ws/2004/08/addressing"><ResourceURI xmlns="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd">http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_BootSourceSetting</ResourceURI><SelectorSet xmlns="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd"><Selector Name="InstanceID">Intel(r) AMT: Force OCR UEFI HTTPS Boot</Selector></SelectorSet></ReferenceParameters>', function (stack, name, response, status) {
                 if (isAmtDeviceValid(dev) == false) return; // Device no longer exists, ignore this request.
                 if (status != 200) { dev.consoleMsg("Failed to set boot config (" + status + ")."); return; }
                 dev.amtstack.RequestPowerStateChange(10, function (stack, name, response, status) { // 10 = Reset, 2 = Power Up
@@ -2620,7 +2632,14 @@ module.exports.CreateAmtManager = function (parent) {
                     if (domain && domain.amtmanager && (domain.amtmanager.tlsacmactivation == true)) { TlsAcmActivation = true; }
 
                     // Check Intel AMT version
-                    if (typeof dev.intelamt.ver == 'string') { var verSplit = dev.intelamt.ver.split('.'); if (verSplit.length >= 3) { dev.aquired.majorver = parseInt(verSplit[0]); dev.aquired.minorver = parseInt(verSplit[1]); } }
+                    if (typeof dev.intelamt.ver == 'string') {
+                        var verSplit = dev.intelamt.ver.split('.');
+                        if (verSplit.length >= 2) {
+                            dev.aquired.majorver = parseInt(verSplit[0]);
+                            dev.aquired.minorver = parseInt(verSplit[1]);
+                            if (verSplit.length >= 3) { dev.aquired.maintenancever = parseInt(verSplit[2]); }
+                        }
+                    }
 
                     // If this is Intel AMT 14 or better and allowed, we are going to attempt a host-based end-to-end TLS activation.
                     if (TlsAcmActivation && (dev.aquired.majorver >= 14)) {
@@ -2676,7 +2695,15 @@ module.exports.CreateAmtManager = function (parent) {
         dev.aquired.controlMode = 1; // 1 = CCM, 2 = ACM
         if (typeof dev.amtstack.wsman.comm.amtVersion == 'string') {
             var verSplit = dev.amtstack.wsman.comm.amtVersion.split('.');
-            if (verSplit.length >= 3) { dev.aquired.version = verSplit[0] + '.' + verSplit[1] + '.' + verSplit[2]; dev.aquired.majorver = parseInt(verSplit[0]); dev.aquired.minorver = parseInt(verSplit[1]); }
+            if (verSplit.length >= 2) {
+                dev.aquired.version = verSplit[0] + '.' + verSplit[1];
+                dev.aquired.majorver = parseInt(verSplit[0]);
+                dev.aquired.minorver = parseInt(verSplit[1]);
+                if (verSplit.length >= 3) {
+                    dev.aquired.version = verSplit[0] + '.' + verSplit[1] + '.' + verSplit[2];
+                    dev.aquired.maintenancever = parseInt(verSplit[2]);
+                }
+            }
         }
         if ((typeof dev.mpsConnection.tag.meiState.OsHostname == 'string') && (typeof dev.mpsConnection.tag.meiState.OsDnsSuffix == 'string')) {
             dev.aquired.host = dev.mpsConnection.tag.meiState.OsHostname + '.' + dev.mpsConnection.tag.meiState.OsDnsSuffix;
@@ -2811,8 +2838,10 @@ module.exports.CreateAmtManager = function (parent) {
                 var vs = getInstance(amtlogicalelements, 'AMT')['VersionString'];
                 if (vs != null) {
                     dev.aquired.version = vs;
-                    dev.aquired.versionmajor = parseInt(dev.aquired.version.split('.')[0]);
-                    dev.aquired.versionminor = parseInt(dev.aquired.version.split('.')[1]);
+                    version = dev.aquired.version.split('.')
+                    dev.aquired.versionmajor = parseInt(version[0]);
+                    dev.aquired.versionminor = parseInt(version[1]);
+                    if (version.length > 2) { dev.aquired.versionmaintenance = parseInt(version[2]); }
                 }
             }
         }
@@ -2820,10 +2849,14 @@ module.exports.CreateAmtManager = function (parent) {
         // Fetch the Intel AMT version from HTTP stack
         if ((dev.amtversionstr == null) && (stack.wsman.comm.amtVersion != null)) {
             var s = stack.wsman.comm.amtVersion.split('.');
-            if (s.length >= 3) {
-                dev.aquired.version = s[0] + '.' + s[1] + '.' + s[2];
+            if (s.length >= 2) {
+                dev.aquired.version = s[0] + '.' + s[1] + '.';
                 dev.aquired.versionmajor = parseInt(s[0]);
                 dev.aquired.versionminor = parseInt(s[1]);
+                if (s.length >= 3) {
+                    dev.aquired.version = s[0] + '.' + s[1] + '.' + s[2];
+                    dev.aquired.versionmaintenance = parseInt(s[2]);
+                }
             }
         }
 

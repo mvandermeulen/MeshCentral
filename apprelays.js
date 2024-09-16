@@ -1,4 +1,4 @@
-﻿/**
+/**
 * @description MeshCentral MSTSC & SSH relay
 * @author Ylian Saint-Hilaire & Bryan Roe
 * @copyright Intel Corporation 2018-2022
@@ -458,7 +458,7 @@ module.exports.CreateWebRelay = function (parent, db, args, domain, mtype) {
             const protocol = (args.tlsoffload) ? 'ws' : 'wss';
             var domainadd = '';
             if ((domain.dns == null) && (domain.id != '')) { domainadd = domain.id + '/' }
-            const url = protocol + '://localhost:' + args.port + '/' + domainadd + (((obj.mtype == 3) && (obj.relaynodeid == null)) ? 'local' : 'mesh') + 'relay.ashx?p=14&auth=' + cookie; // Protocol 14 is Web-TCP
+            var url = protocol + '://localhost:' + args.port + '/' + domainadd + (((obj.mtype == 3) && (obj.relaynodeid == null)) ? 'local' : 'mesh') + 'relay.ashx?p=14&auth=' + cookie; // Protocol 14 is Web-TCP
             if (domain.id != '') { url += '&domainid=' + domain.id; } // Since we are using "localhost", we are going to signal what domain we are on using a URL argument.
             parent.parent.parent.debug('relay', 'TCP: Connection websocket to ' + url);
             obj.wsClient = new WebSocket(url, options);
@@ -717,7 +717,7 @@ module.exports.CreateWebRelay = function (parent, db, args, domain, mtype) {
                             }
                         }
                     }
-                    else if (blockHeaders.indexOf(i) == -1) { obj.res.set(i, header[i]); } // Set the headers if not blocked
+                    else if (blockHeaders.indexOf(i) == -1) { obj.res.set(i.trim(), header[i]); } // Set the headers if not blocked
                 }
                 obj.res.set('Content-Security-Policy', "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:;"); // Set an "allow all" policy, see if the can restrict this in the future
                 //obj.res.set('Content-Security-Policy', "default-src * 'unsafe-inline' 'unsafe-eval'; script-src * 'unsafe-inline' 'unsafe-eval'; connect-src * 'unsafe-inline'; img-src * data: blob: 'unsafe-inline'; frame-src *; style-src * 'unsafe-inline';"); // Set an "allow all" policy, see if the can restrict this in the future
@@ -842,22 +842,21 @@ module.exports.CreateMstscRelay = function (parent, db, ws, req, args, domain) {
                             obj.relaySocket.resume();
                         }
                     } else {
-                        if (typeof data == 'string') {
-                            // Forward any ping/pong commands to the browser
-                            var cmd = null;
-                            try { cmd = JSON.parse(data); } catch (ex) { }
+                        try {  // Forward any ping/pong commands to the browser
+                            var cmd = JSON.parse(data); 
                             if ((cmd != null) && (cmd.ctrlChannel == '102938')) {
                                 if (cmd.type == 'ping') { send(['ping']); }
                                 else if (cmd.type == 'pong') { send(['pong']); }
                             }
                             return;
+                        } catch (ex) { // You are not JSON data so just send over relaySocket
+                            obj.wsClient._socket.pause();
+                            try {
+                                obj.relaySocket.write(data, function () {
+                                    if (obj.wsClient && obj.wsClient._socket) { try { obj.wsClient._socket.resume(); } catch (ex) { console.log(ex); } }
+                                });
+                            } catch (ex) { console.log(ex); obj.close(); }
                         }
-                        obj.wsClient._socket.pause();
-                        try {
-                            obj.relaySocket.write(data, function () {
-                                if (obj.wsClient && obj.wsClient._socket) { try { obj.wsClient._socket.resume(); } catch (ex) { console.log(ex); } }
-                            });
-                        } catch (ex) { console.log(ex); obj.close(); }
                     }
                 });
                 obj.wsClient.on('close', function () { parent.parent.debug('relay', 'RDP: Relay websocket closed'); obj.close(); });
@@ -984,6 +983,7 @@ module.exports.CreateMstscRelay = function (parent, db, ws, req, args, domain) {
                         if ((node == null) || (visible == false) || ((rights & MESHRIGHT_REMOTECONTROL) == 0)) { obj.close(); return; }
                         if ((rights != MESHRIGHT_ADMIN) && ((rights & MESHRIGHT_REMOTEVIEWONLY) != 0)) { obj.viewonly = true; }
                         if ((rights != MESHRIGHT_ADMIN) && ((rights & MESHRIGHT_DESKLIMITEDINPUT) != 0)) { obj.limitedinput = true; }
+                        node = parent.common.unEscapeLinksFieldName(node); // unEscape node data for rdp/ssh credentials
                         obj.mtype = node.mtype; // Store the device group type
                         obj.meshid = node.meshid; // Store the MeshID
 
@@ -1046,7 +1046,11 @@ module.exports.CreateMstscRelay = function (parent, db, ws, req, args, domain) {
                         if ((k == 14) || (k == 28)) { ok = true; } // Enter and backspace
                         if (ok == false) return;
                     }
-                    if (rdpClient && (obj.viewonly != true)) { rdpClient.sendKeyEventScancode(msg[1], msg[2]); } break;
+                    var extended = false;
+                    var extendedkeys = [57419,57421,57416,57424,57426,57427,57417,57425,57372,57397,57415,57423,57373,57400,57399];
+                    // left,right,up,down,insert,delete,pageup,pagedown,numpadenter,numpaddivide,home,end,controlright,altright,printscreen
+                    if (extendedkeys.includes(msg[1])) extended=true;
+                    if (rdpClient && (obj.viewonly != true)) { rdpClient.sendKeyEventScancode(msg[1], msg[2], extended); } break;
                 }
                 case 'unicode': { if (rdpClient && (obj.viewonly != true)) { rdpClient.sendKeyEventUnicode(msg[1], msg[2]); } break; }
                 case 'utype': {
@@ -1210,7 +1214,7 @@ module.exports.CreateSshRelay = function (parent, db, ws, req, args, domain) {
             const protocol = (args.tlsoffload) ? 'ws' : 'wss';
             var domainadd = '';
             if ((domain.dns == null) && (domain.id != '')) { domainadd = domain.id + '/' }
-            const url = protocol + '://localhost:' + args.port + '/' + domainadd + (((obj.mtype == 3) && (obj.relaynodeid == null)) ? 'local' : 'mesh') + 'relay.ashx?p=11&auth=' + obj.xcookie; // Protocol 11 is Web-SSH
+            var url = protocol + '://localhost:' + args.port + '/' + domainadd + (((obj.mtype == 3) && (obj.relaynodeid == null)) ? 'local' : 'mesh') + 'relay.ashx?p=11&auth=' + obj.xcookie; // Protocol 11 is Web-SSH
             if (domain.id != '') { url += '&domainid=' + domain.id; } // Since we are using "localhost", we are going to signal what domain we are on using a URL argument.
             parent.parent.debug('relay', 'SSH: Connection websocket to ' + url);
             obj.wsClient = new WebSocket(url, options);
@@ -1277,16 +1281,14 @@ module.exports.CreateSshRelay = function (parent, db, ws, req, args, domain) {
                         ws._socket.resume();
                     }
                 } else {
-                    if (typeof data == 'string') {
-                        // Forward any ping/pong commands to the browser
+                    try { // Forward any ping/pong commands to the browser
                         var cmd = null;
-                        try { cmd = JSON.parse(data); } catch (ex) { }
+                        cmd = JSON.parse(data);
                         if ((cmd != null) && (cmd.ctrlChannel == '102938') && ((cmd.type == 'ping') || (cmd.type == 'pong'))) { obj.ws.send(data); }
                         return;
+                    } catch(ex) { // Relay WS --> SSH instead
+                        if ((data.length > 0) && (obj.ser != null)) { try { obj.ser.updateBuffer(data); } catch (ex) { console.log(ex); } }
                     }
-
-                    // Relay WS --> SSH
-                    if ((data.length > 0) && (obj.ser != null)) { try { obj.ser.updateBuffer(data); } catch (ex) { console.log(ex); } }
                 }
             });
             obj.wsClient.on('close', function () { parent.parent.debug('relay', 'SSH: Relay websocket closed'); obj.close(); });
@@ -1314,7 +1316,7 @@ module.exports.CreateSshRelay = function (parent, db, ws, req, args, domain) {
                             // Check if we have SSH credentials for this device
                             parent.parent.db.Get(obj.cookie.nodeid, function (err, nodes) {
                                 if ((err != null) || (nodes == null) || (nodes.length != 1)) return;
-                                const node = nodes[0];
+                                const node = parent.common.unEscapeLinksFieldName(nodes[0]); // unEscape node data for rdp/ssh credentials
                                 if ((domain.allowsavingdevicecredentials === false) || (node.ssh == null) || (typeof node.ssh != 'object') || (node.ssh[obj.userid] == null) || (typeof node.ssh[obj.userid].u != 'string') || ((typeof node.ssh[obj.userid].p != 'string') && (typeof node.ssh[obj.userid].k != 'string'))) {
                                     // Send a request for SSH authentication
                                     try { ws.send(JSON.stringify({ action: 'sshauth' })) } catch (ex) { }
@@ -1362,7 +1364,7 @@ module.exports.CreateSshRelay = function (parent, db, ws, req, args, domain) {
                         obj.termSize = msg;
                         parent.parent.db.Get(obj.cookie.nodeid, function (err, nodes) {
                             if ((err != null) || (nodes == null) || (nodes.length != 1)) return;
-                            const node = nodes[0];
+                            const node = parent.common.unEscapeLinksFieldName(nodes[0]); // unEscape node data for rdp/ssh credentials
                             if (node.ssh != null) {
                                 obj.username = node.ssh.u;
                                 obj.privateKey = node.ssh.k;
@@ -1404,7 +1406,7 @@ module.exports.CreateSshRelay = function (parent, db, ws, req, args, domain) {
     parent.parent.db.Get(obj.cookie.nodeid, function (err, nodes) {
         if (obj.cookie == null) return; // obj has been cleaned up, just exit.
         if ((err != null) || (nodes == null) || (nodes.length != 1)) { parent.parent.debug('relay', 'SSH: Invalid device'); obj.close(); }
-        const node = nodes[0];
+        const node = parent.common.unEscapeLinksFieldName(nodes[0]); // unEscape node data for rdp/ssh credentials
         obj.nodeid = node._id; // Store the NodeID
         obj.meshid = node.meshid; // Store the MeshID
         obj.mtype = node.mtype; // Store the device group type
@@ -1549,7 +1551,7 @@ module.exports.CreateSshTerminalRelay = function (parent, db, ws, req, domain, u
             const protocol = (args.tlsoffload) ? 'ws' : 'wss';
             var domainadd = '';
             if ((domain.dns == null) && (domain.id != '')) { domainadd = domain.id + '/' }
-            const url = protocol + '://localhost:' + args.port + '/' + domainadd + (((obj.mtype == 3) && (obj.relaynodeid == null)) ? 'local' : 'mesh') + 'relay.ashx?p=11&auth=' + authCookie // Protocol 11 is Web-SSH
+            var url = protocol + '://localhost:' + args.port + '/' + domainadd + (((obj.mtype == 3) && (obj.relaynodeid == null)) ? 'local' : 'mesh') + 'relay.ashx?p=11&auth=' + authCookie // Protocol 11 is Web-SSH
             if (domain.id != '') { url += '&domainid=' + domain.id; } // Since we are using "localhost", we are going to signal what domain we are on using a URL argument.
             parent.parent.debug('relay', 'SSH: Connection websocket to ' + url);
             obj.wsClient = new WebSocket(url, options);
@@ -1617,16 +1619,14 @@ module.exports.CreateSshTerminalRelay = function (parent, db, ws, req, domain, u
                         ws._socket.resume();
                     }
                 } else {
-                    if (typeof data == 'string') {
-                        // Forward any ping/pong commands to the browser
+                    try { // Forward any ping/pong commands to the browser
                         var cmd = null;
-                        try { cmd = JSON.parse(data); } catch (ex) { }
+                        cmd = JSON.parse(data);
                         if ((cmd != null) && (cmd.ctrlChannel == '102938') && ((cmd.type == 'ping') || (cmd.type == 'pong'))) { try { obj.ws.send(data); } catch (ex) { console.log(ex); } }
                         return;
+                    } catch (ex) { // Relay WS --> SSH
+                        if ((data.length > 0) && (obj.ser != null)) { try { obj.ser.updateBuffer(data); } catch (ex) { console.log(ex); } }
                     }
-
-                    // Relay WS --> SSH
-                    if ((data.length > 0) && (obj.ser != null)) { try { obj.ser.updateBuffer(data); } catch (ex) { console.log(ex); } }
                 }
             });
             obj.wsClient.on('close', function () {
@@ -1739,6 +1739,7 @@ module.exports.CreateSshTerminalRelay = function (parent, db, ws, req, domain, u
     if ((user == null) || (req.query.nodeid == null)) { obj.close(); return; } // Invalid nodeid
     parent.GetNodeWithRights(domain, user, req.query.nodeid, function (node, rights, visible) {
         if (obj.ws == null) return; // obj has been cleaned up, just exit.
+        node = parent.common.unEscapeLinksFieldName(node); // unEscape node data for rdp/ssh credentials
 
         // Check permissions
         if ((rights & 8) == 0) { obj.close(); return; } // No MESHRIGHT_REMOTECONTROL rights
@@ -1903,7 +1904,7 @@ module.exports.CreateSshFilesRelay = function (parent, db, ws, req, domain, user
             const protocol = (args.tlsoffload) ? 'ws' : 'wss';
             var domainadd = '';
             if ((domain.dns == null) && (domain.id != '')) { domainadd = domain.id + '/' }
-            const url = protocol + '://localhost:' + args.port + '/' + domainadd + (((obj.mtype == 3) && (obj.relaynodeid == null)) ? 'local' : 'mesh') + 'relay.ashx?p=13&auth=' + authCookie // Protocol 13 is Web-SSH-Files
+            var url = protocol + '://localhost:' + args.port + '/' + domainadd + (((obj.mtype == 3) && (obj.relaynodeid == null)) ? 'local' : 'mesh') + 'relay.ashx?p=13&auth=' + authCookie // Protocol 13 is Web-SSH-Files
             if (domain.id != '') { url += '&domainid=' + domain.id; } // Since we are using "localhost", we are going to signal what domain we are on using a URL argument.
             parent.parent.debug('relay', 'SSH: Connection websocket to ' + url);
             obj.wsClient = new WebSocket(url, options);
@@ -1965,16 +1966,15 @@ module.exports.CreateSshFilesRelay = function (parent, db, ws, req, domain, user
                         ws._socket.resume();
                     }
                 } else {
-                    if (typeof data == 'string') {
+                    try {
                         // Forward any ping/pong commands to the browser
                         var cmd = null;
-                        try { cmd = JSON.parse(data); } catch (ex) { }
+                        cmd = JSON.parse(data);
                         if ((cmd != null) && (cmd.ctrlChannel == '102938') && ((cmd.type == 'ping') || (cmd.type == 'pong'))) { obj.ws.send(data); }
                         return;
+                    } catch (ex) { // Relay WS --> SSH
+                        if ((data.length > 0) && (obj.ser != null)) { try { obj.ser.updateBuffer(data); } catch (ex) { console.log(ex); } }
                     }
-
-                    // Relay WS --> SSH
-                    if ((data.length > 0) && (obj.ser != null)) { try { obj.ser.updateBuffer(data); } catch (ex) { console.log(ex); } }
                 }
             });
             obj.wsClient.on('close', function () {
@@ -2269,6 +2269,7 @@ module.exports.CreateSshFilesRelay = function (parent, db, ws, req, domain, user
     if ((user == null) || (req.query.nodeid == null)) { obj.close(); return; } // Invalid nodeid
     parent.GetNodeWithRights(domain, user, req.query.nodeid, function (node, rights, visible) {
         if (obj.ws == null) return; // obj has been cleaned up, just exit.
+        node = parent.common.unEscapeLinksFieldName(node); // unEscape node data for rdp/ssh credentials
 
         // Check permissions
         if ((rights & 8) == 0) { obj.close(); return; } // No MESHRIGHT_REMOTECONTROL rights

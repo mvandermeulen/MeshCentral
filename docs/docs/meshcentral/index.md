@@ -1,8 +1,8 @@
 # Meshcentral2 Guide
 
-[MeshCentral2 Guide](https://meshcentral.com/info/docs/MeshCentral2UserGuide.pdf)
+[MeshCentral2 Guide](https://meshcentral.com/docs/MeshCentral2UserGuide.pdf)
 
-MeshCmd Guide [as .pdf](https://meshcentral.com/info/docs/MeshCmdUserGuide.pdf) [as .odt](https://github.com/Ylianst/MeshCentral/blob/master/docs/MeshCentral User's Guide v0.2.9.odt?raw=true)
+MeshCmd Guide [as .pdf](https://meshcentral.com/docs/MeshCmdUserGuide.pdf) [as .odt](https://github.com/Ylianst/MeshCentral/blob/master/docs/MeshCentral User's Guide v0.2.9.odt?raw=true)
 
 ## Video Walkthru
 
@@ -213,7 +213,7 @@ As indicated before, the settings section of the config.json is equivalent to pa
 | RedirPort | This is the port for redirecting traffic in the web server. When the server is configured with HTTPS, users that uses HTTP will be redirected to HTTPS. Port 80 is the default port. So, redirection will happen from port 80 to port 443.  |
 | MpsPort | Port for Intel" AMT Management Presence Server to receive Intel" AMT CIRA (Client Initiated Remote Access) connections. The default is port 4433. This port is disabled in LAN mode. If user don"t plan on using Intel" AMT for management, this port can be left as-is. |
 | TLSOffload | By default this option is set to "false". If set to "true", server will run both web port and the Intel AMT MPS port without TLS with the assumption that a TLS offloading is taking care of this task. For further details, see the "TLS Offloading" section. This option can also be set to the IP address of the reverse-proxy in order to indicate to MeshCental to only trust HTTP X-Forwarded headers coming from this IP address. See the "Reverse-Proxy Setup" section for an example. |
-| SelfUpdate | When set to "true" the server will check for a new version and attempt to self-update automatically a bit after midnight local time every day. For this to work, the server needs to run with sufficient permissions to overwrite its own files. If you run the server with more secure, restricted privileges, this option should not be used. If set to a specific version such as "0.2.7-g" when the server will immediately update to the specified version on startup if it"s not already at this version. |
+| SelfUpdate | When set to "true" the server will check for a new version and attempt to self-update automatically a bit after midnight local time every day. If set to a specific version such as "1.1.21" the server will immediately update to the specified version on startup if it's not already at this version. |
 | SessionKey | This is the encryption key used to secure the user"s login session. It will encrypt the browser cookie. By default, this value is randomly generated each time the server starts. If many servers are used with a load balancer, all servers should use the same session key. In addition, one can set this key so that when the server restarts, users do not need to re-login to the server. |
 | Minify | Default value is 0, when set to 1 the server will serve "minified" web pages, that is, web pages that have all comments, white spaces and other unused characters removed. This reduces the data size of the web pages by about half and reduced the number requests made by the browser. The source code of the web page will not be easily readable, adding "&nominify=1" at the end of the URL will override this option. |
 | User | Specify a username that browsers will be automatically logged in as. Useful to skip the login page and password prompts. Used heavily during development of MeshCentral. |
@@ -304,6 +304,120 @@ The “servers” section of the configuration file should have the identifier o
 When the MongoDB is setup for the first time, a unique identifier is generated and written into the DB. To prevent situations where two servers with different database from peering together, during peering process, each server will validate among each other if they have the same unique DB identifier. Peering connection will only succeed if this condition is met. 
 
 Once peered, all of the servers should act like one single host, no matter which server the user(s) are connected to.
+
+## Email Setup
+
+We highly recommend the use of an email server (SMTP) because we could allow MeshCentral to verify user account’s email address by sending a confirmation request to the user to complete the account registration and for password recovery, should a user forget account password as illustrated below
+
+A verification email is sent when a new account is created or if the user requests it in the “My Account” tab.
+
+![](images/2022-05-19-00-00-05.png)
+
+The password recovery flow when “Reset Account” is triggered at the login page.
+
+![](images/2022-05-19-00-00-18.png)
+
+Both account verification and password recovery are triggered automatically once SMTP mail server configuration is included into the config.json file.
+
+#### SMTP: User/Pass
+##### Normal Server
+
+Update the config.json with “smtp” section as shown below and restart the server. 
+
+```json
+{
+  "smtp": {
+    "host": "smtp.server.com",
+    "port": 25,
+    "from": "myaddress@server.com",
+    "user": "myaddress@server.com",      # Optional
+    "pass": "mypassword",                # Optional
+    "tls": false                         # Optional, default false
+  }
+}
+```
+
+Please map the host, port values to connect to the right host that provides this SMTP service. For “from” value, administrators may put something like donotreply@server.com, but often times it needs to be a valid address since SMTP server will not send out messages with an invalid reply address. 
+
+Some SMTP servers will require a valid username and password to login to the mail server. This is to prevent unauthorized e-mail correspondence. TLS option can be set to ‘true’ if the SMTP server requires TLS.
+
+##### Gmail
+
+One option is to configure MeshCentral work with Google Gmail by setting “host” with smtp.gmail.com, and “port” with 587. In the config.json file, use user’s Gmail address for both “from” and “user” and Gmail password in the “pass” value. You will also need to enable “Less secure app access” in for this Google account. It’s in the account settings, security section:
+
+![](images/2022-05-19-00-01-19.png)
+
+If a Google account is setup with 2-factor authentication, the option to allow less secure applications not be available. Because the Google account password is in the MeshCentral config.json file and that strong authentication can’t be used, it’s preferable to use a dedicated Google account for MeshCentral email.
+
+#### SMTP: OAuth Authentication
+##### Gmail
+
+Google has announced that less secure app access will be phased out.  For Google Workspace or G-Suite accounts, the following process can be used to allow OAuth2 based authentication with Google's SMTP server.  It is likely a very similar process for regular Gmail accounts.
+
+Start by visiting the Google API console:
+
+https://console.developers.google.com/
+
+First, you will create a new project. Name it something unique in case you need to create more in the future. In this example, I've named the project "MeshCentral"
+
+![](images/gc-newproject.png)
+
+Click on the "OAuth Consent Screen" link, Under "APIs and Services" from the left hand menu:
+
+![](images/gc-oauthconsent.png)
+
+If you have a Google Workspace account, you will have the option to choose "Internal" application and skip the next steps.  If not, you will be required to provide Google with information about why you want access, as well as verifying domain ownership.  
+
+![](images/OAuth-Internal-External.png)
+
+Add the Gmail address under which you have created this project to the fields labelled ‘User support email’ and ‘Developer contact information’ so that you will be allowed for authentication. After that, you will want to add a scope for your app, so that your token is valid for gmail:
+
+![](images/gc-oauthscopes.png)
+
+Once this is complete, the next step will be to add credentials.  
+
+![](images/gc-oauthcredentials.png)
+
+Choose OAuth Client
+
+You will obtain a Client ID and a Client secret once you've completed the process. Be sure to store the secret immediately, as you won't be able to retreive it after you've dismissed the window.
+
+Next, you will need to visit the Google OAuth Playground:
+
+https://developers.google.com/oauthplayground
+
+![](images/gc-playground.webp)
+
+Enter your Client ID and secret from the last step.  On the left side of the page, you should now see a text box that allows you to add your own scopes.  Enter https://mail.google.com and click Authorize API.
+
+You will need to follow the instructions provided to finish the authorization process. Once that is complete, you should receive a refresh token. The refresh token, Client ID and Client Secret are the final items we need to complete the SMTP section of our config.json. It should now look something like this:
+
+```
+"smtp": {
+    "host": "smtp.gmail.com",
+    "port": 587,
+    "from": "my@googleaccount.com",
+    "auth": {
+      "clientId": "<YOUR-CLIENT-ID>",
+      "clientSecret": "<YOUR-CLIENT-SECRET>",
+      "refreshToken": "<YOUR-REFRESH-TOKEN>"
+    },
+    "user": "noreply@authorizedgooglealias.com",
+    "emailDelaySeconds": 10,
+    "tls": false,
+    "verifyEmail": true
+  }
+```
+
+
+Regardless of what SMTP account is used, MeshCentral will perform a test connection to make sure the server if working as expected when starting. Hence, the user will be notified if Meshcentral and SMTP server has been configured correctly as shown below.
+
+![](images/2022-05-19-00-01-43.png)
+
+After successfully configuring the Gmail SMTP server, switch the OAuth 'Publishing Status' from `Testing` to `In Production`. This step prevents the need for frequent refresh token generation. Verification of your project isn't required to make this change.
+
+![](images/In-production.png)
+
 
 ## Database
 
@@ -438,14 +552,14 @@ To make this happen, we will be using the following command line options from Me
 | --dblistconfigfiles                      | List the names and size of all configuration files in the database.                                                                                                                                       |
 | --dbshowconfigfile (filename)            | Show the content of a specified filename from the database. --configkey is required.                                                                                                                      |
 | --dbdeleteconfigfiles                    | Delete all configuration files from the database.                                                                                                                                                         |
-| --dbpushconfigfiles (*) or (folder path) | Push a set of configuration files into the database, removing any existing files in the process. When * is specified, the “meshcentral-data” folder up pushed into the database. --configkey is required. |
+| --dbpushconfigfiles '*' or (folder path) | Push a set of configuration files into the database, removing any existing files in the process. When * is specified, the “meshcentral-data” folder up pushed into the database. --configkey is required. |
 | --dbpullconfigfiles (folder path)        | Get all of the configuration files from the database and place them in the specified folder. Files in the target folder may be overwritten. --configkey is required.                                      |
 | --loadconfigfromdb (key)                 | Runs MeshCentral server using the configuration files found in the database. The configkey may be specified with this command or --configkey can be used.                                                 |
 
 Once we have MeshCentral running as expected using the “meshcentral-data” folder, we can simply push that configuration into the database and run using the database alone like this:
 
 ```
-node ./node_modules/meshcentral --dbpushconfigfiles * --configkey mypassword
+node ./node_modules/meshcentral --dbpushconfigfiles '*' --configkey mypassword
 
 node ./node_modules/meshcentral --loadconfigfromdb mypassword --mongodb "mongodb://127.0.0.1:27017/meshcentral"
 ```
@@ -609,46 +723,6 @@ All the lines that start with a number or `:` will be used, everything else is i
 95.85.81.0/24
 ```
 
-## Email Setup
-
-We highly recommend the use of an email server (SMTP) because we could allow MeshCentral to verify user account’s email address by sending a confirmation request to the user to complete the account registration and for password recovery, should a user forget account password as illustrated below
-
-A verification email is sent when a new account is created or if the user requests it in the “My Account” tab.
-
-![](images/2022-05-19-00-00-05.png)
-
-The password recovery flow when “Reset Account” is triggered at the login page.
-
-![](images/2022-05-19-00-00-18.png)
-
-Both account verification and password recovery are triggered automatically once SMTP mail server configuration is included into the config.json file. Update the config.json with “smtp” section as shown below and restart the server. 
-
-```json
-{
-  "smtp": {
-    "host": "smtp.server.com",
-    "port": 25,
-    "from": "myaddress@server.com",
-    "user": "myaddress@server.com",       Optional
-    "pass": "mypassword",                 Optional
-    "tls": false                          Optional, default false
-  }
-}
-```
-
-Please map the host, port values to connect to the right host that provides this SMTP service. For “from” value, administrators may put something like donotreply@server.com, but often times it needs to be a valid address since SMTP server will not send out messages with an invalid reply address. 
-
-Some SMTP servers will require a valid username and password to login to the mail server. This is to prevent unauthorized e-mail correspondence. TLS option can be set to ‘true’ if the SMTP server requires TLS.
-
-One option is to configure MeshCentral work with Google Gmail* by setting “host” with smtp.gmail.com, and “port” with 587. In the config.json file, use user’s Gmail* address for both “from” and “user” and Gmail* password in the “pass” value. You will also need to enable “Less secure app access” in for this Google account. It’s in the account settings, security section:
-
-![](images/2022-05-19-00-01-19.png)
-
-If a Google account is setup with 2-factor authentication, the option to allow less secure applications not be available. Because the Google account password is in the MeshCentral config.json file and that strong authentication can’t be used, it’s preferable to use a dedicated Google account for MeshCentral email.
-
-Regardless of what SMTP account is used, MeshCentral will perform a test connection to make sure the server if working as expected when starting. Hence, the user will be notified if Meshcentral and SMTP server has been configured correctly as shown below.
-
-![](images/2022-05-19-00-01-43.png)
 
 ## Embedding MeshCentral
 
@@ -826,6 +900,12 @@ In this example, we will:
 - We will have NGINX perform all TLS authentication & encryption.
 - MeshCentral will read the NGINX web certificate so agents will perform correct server authentication.
 - NGINX will be setup with long timeouts, because agents have long standard web socket connections.
+
+!!!note
+    With SELinux, NGINX reverse proxy requires 'setsebool -P httpd_can_network_relay 1'
+    Caution: httpd_can_network_relay only allows certain ports
+    Confirm you are using ports from this subset in MeshCentral
+    If you want to use a different port then you will need to add it to http_port_t
 
 Let’s get started by configuring MeshCentral with the following values in config.json:
 
@@ -1014,8 +1094,7 @@ First we will start with the MeshCentral configuration, here is a minimal config
   },
   "domains": {
     "": {
-      "certUrl": "https://127.0.0.1:443/",
-      "agentConfig": [ "webSocketMaskOverride=1" ],
+      "certUrl": "https://127.0.0.1:443/"
     }
   }
 }
@@ -1198,133 +1277,6 @@ And taking authentication to the next step is removing the login page entirely. 
 <div class="video-wrapper">
   <iframe width="320" height="180" src="https://www.youtube.com/embed/-WKY8Wy0Huk" frameborder="0" allowfullscreen></iframe>
 </div>
-
-## Branding & Terms of use
-
-Whitelabeling your MeshCentral installation to personalize it to your companies brand, as well as having your own terms of use is one of the first things many people do after installation.
-
-<div class="video-wrapper">
-  <iframe width="320" height="180" src="https://www.youtube.com/embed/xUZ1w9RSKpQ" frameborder="0" allowfullscreen></iframe>
-</div>
-
-### Branding
-
-You can put you own logo on the top of the web page. To get started, get the file “logoback.png” from the folder “node_modules/meshcentral/public/images” and copy it to your “meshcentral-data” folder. In this example, we will change the name of the file “logoback.png” to “title-mycompany.png”. Then use any image editor to change the image and place your logo.
-
-![](images/2022-05-19-00-38-51.png)
-
-Once done, edit the config.json file and set one or all of the following values:
-
-```json
-"domains": {
-  "": {
-    "Title": "",
-    "Title2": "",
-    "TitlePicture": "title-sample.png",
-    "loginPicture": "logintitle-sample.png",
-    "welcomeText": "This is sample text",
-    "welcomePicture": "mainwelcome-04.jpg",
-    "welcomePictureFullScreen": true,
-    "siteStyle": "1",
-    "nightMode": "1",
-    "meshMessengerTitle": "Mesh Chat",
-    "meshMessengerPicture": "chatimage.png",
-    "footer": "This is a HTML string displayed at the bottom of the web page when a user is logged in.",
-    "loginfooter": "This is a HTML string displayed at the bottom of the web page when a user is not logged in."
-  },
-```
-
-This will set the title and sub-title text to empty and set the background image to the new title picture file. You can now restart the serve and take a look at the web page. Both the desktop and mobile sites will change.
-
-![](images/2022-05-19-00-39-35.png)
-
-![](images/2022-05-19-00-39-42.png)
-
-The title image must a PNG image of size 450 x 66.
-
-You can also customize the server icon in the “My Server” tab. By default, it’s a picture of a desktop with a padlock.
-
-![](images/2022-05-19-00-40-00.png)
-
-If, for example, MeshCentral is running on a Raspberry Pi. You may want to put a different picture at this location. Just put a “server.jpg” file that is 200 x 200 pixels in the “meshcentral-data” folder. The time MeshCentral page is loaded, you will see the new image.
-
-![](images/2022-05-19-00-40-13.png)
-
-This is great to personalize the look of the server within the web site.
-
-### Agent Branding
-
-You can also customize the Agent to add your own logo.
-
-![](images/2022-08-24-06-42-40.png)
-
-```json
- "agentCustomization": {
- 	"displayName": {
- 		"type": "string",
- 		"default": "MeshCentral Agent",
- 		"description": "The name of the agent as displayed to the user."
- 	},
- 	"description": {
- 		"type": "string",
- 		"default": "Mesh Agent background service",
- 		"description": "The description of the agent as displayed to the user."
- 	},
- 	"companyName": {
- 		"type": "string",
- 		"default": "Mesh Agent",
- 		"description": "This will be used as the path to install the agent, by default this is 'Mesh Agent' in Windows and 'meshagent' in other OS's."
- 	},
- 	"serviceName": {
- 		"type": "string",
- 		"default": "Mesh Agent",
- 		"description": "The name of the background service, by default this is 'Mesh Agent' in Windows and 'meshagent' in other OS's but should be set to an all lower case, no space string."
- 	},
- 	"installText": {
- 		"type": "string",
- 		"default": null,
- 		"description": "Text string to show in the agent installation dialog box."
- 	},
- 	"image": {
- 		"type": "string",
- 		"default": null,
- 		"description": "The filename of a image file in .png format located in meshcentral-data to display in the MeshCentral Agent installation dialog, image should be square and from 64x64 to 200x200."
- 	},
- 	"fileName": {
- 		"type": "string",
- 		"default": "meshagent",
- 		"description": "The agent filename."
- 	},
- 	"foregroundColor": {
- 		"type": "string",
- 		"default": null,
- 		"description": "Foreground text color, valid values are RBG in format 0,0,0 to 255,255,255 or format #000000 to #FFFFFF."
- 	},
- 	"backgroundColor": {
- 		"type": "string",
- 		"default": null,
- 		"description": "Background color, valid values are RBG in format 0,0,0 to 255,255,255 or format #000000 to #FFFFFF."
- 	}
- }
- ```
-
-![agent icon](images/agentico.png)
-
-!!!note
-    You will need to reinstall the agent for agent customizations to take effect.
-
-### Terms of use
-
-You can change the terms of use of the web site by adding a “terms.txt” file in the “meshcentral-data” folder. The file can include HTML markup. Once set, the server does not need to be restarted, the updated terms.txt file will get used the next time it’s requested.
-
-For example, placing this in “terms.txt”
-
-```
-<br />
-This is a <b>test file</b>.
-```
-
-Will show this on the terms of use web page.
 
 ## Server Backup & Restore
 
@@ -1780,7 +1732,40 @@ The callback URL will be of the form “https://(servername)/auth-saml-callback�
 Enabling SAML will require MeshCentral to install extra modules from NPM, so depending on your server configuration, you may need to run MeshCentral once manually.
 
 !!!note
-  MeshCentral only supports "POST". [For example Authentik's](https://github.com/Ylianst/MeshCentral/issues/4725) default setting is to use "Redirect" as a "Service Provider Binding".
+    MeshCentral only supports "POST". [For example Authentik's](https://github.com/Ylianst/MeshCentral/issues/4725) default setting is to use "Redirect" as a "Service Provider Binding".
+
+### Generic OpenID Connect Setup
+
+Generally, if you are using an IdP that supports OpenID Connect (OIDC), you can use a very basic configuration to get started, and if needed, add more specific or advanced configurations later. Here is what your config file will look like with a basic, generic, configuration.
+
+``` json
+{
+	"settings": {
+		"cert": "mesh.your.domain",
+		"port": 443,
+		"sqlite3": true
+	},
+	"domains": {
+		"": {
+			"title": "Mesh",
+			"title2": ".Your.Domain",
+			"authStrategies": {
+				"oidc": {
+					"issuer": "https://sso.your.domain",
+					"clientid": "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX",
+					"clientsecret": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+					"newAccounts": true
+				}
+			}
+		}
+  }
+}
+```
+
+As you can see, this is roughly the same as all the other OAuth2 based authentication strategies. These are the basics you need to get started using OpenID Connect because it's still authenticating with OAuth2. If you plan to take advantage of some of the more advanced features provided by this strategy you should consider reading the [additional strategy documentation](./openidConnectStrategy.md).
+
+> NOTE: MeshCentral will use `https://mesh.your.domain/auth-oidc-callback` as the default redirect uri.
+
 ## Improvements to MeshCentral
 
 In 2007, the first version of MeshCentral was built. We will refer to it as “MeshCentral1”. When MeshCentral1 was designed, HTML5 did not exist and web sockets where not implemented in any of the major browsers. Many design decisions were made at the time that are no longer optimal today. With the advent of the latest MeshCentral, MeshCentral1 is no longer supported and MeshCentral v2 has been significantly redesigned and mostly re-written based of previous version. Here is a list of improvements made in MeshCentral when compared with MeshCentral1:

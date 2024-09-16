@@ -58,15 +58,15 @@ module.exports.CreateMeshAgent = function (parent, db, ws, req, args, domain) {
         dataAccounting();
 
         if ((arg == 1) || (arg == null)) { try { ws.close(); if (obj.nodeid != null) { parent.parent.debug('agent', 'Soft disconnect ' + obj.nodeid + ' (' + obj.remoteaddrport + ')'); } } catch (e) { console.log(e); } } // Soft close, close the websocket
-        if (arg == 2) { 
-            try { 
+        if (arg == 2) {
+            try {
                 if (ws._socket._parent != null)
                     ws._socket._parent.end();
                 else
                     ws._socket.end();
-                
-                if (obj.nodeid != null) { 
-                    parent.parent.debug('agent', 'Hard disconnect ' + obj.nodeid + ' (' + obj.remoteaddrport + ')'); 
+
+                if (obj.nodeid != null) {
+                    parent.parent.debug('agent', 'Hard disconnect ' + obj.nodeid + ' (' + obj.remoteaddrport + ')');
                 }
             } catch (e) { console.log(e); }
         }
@@ -616,7 +616,7 @@ module.exports.CreateMeshAgent = function (parent, db, ws, req, args, domain) {
         }
 
         if ((mesh == null) && (typeof domain.orphanagentuser == 'string')) {
-            const adminUser = parent.users['user/' + domain.id + '/' + domain.orphanagentuser.toLowerCase()];
+            const adminUser = parent.users['user/' + domain.id + '/' + domain.orphanagentuser];
             if ((adminUser != null) && (adminUser.siteadmin == 0xFFFFFFFF)) {
                 // Mesh name is hex instead of base64
                 const meshname = obj.meshid.substring(0, 18);
@@ -1058,7 +1058,7 @@ module.exports.CreateMeshAgent = function (parent, db, ws, req, args, domain) {
             db.Get('iploc_' + obj.remoteaddr, function (err, iplocs) {
                 if ((iplocs != null) && (iplocs.length == 1)) {
                     // We have a location in the database for this remote IP
-                    const iploc = nodes[0], x = {};
+                    const iploc = iplocs[0], x = {};
                     if ((iploc != null) && (iploc.ip != null) && (iploc.loc != null)) {
                         x.publicip = iploc.ip;
                         x.iploc = iploc.loc + ',' + (Math.floor((new Date(iploc.date)) / 1000));
@@ -1067,10 +1067,10 @@ module.exports.CreateMeshAgent = function (parent, db, ws, req, args, domain) {
                 } else {
                     // Check if we need to ask for the IP location
                     var doIpLocation = 0;
-                    if (device.iploc == null) {
+                    if (obj.iploc == null) {
                         doIpLocation = 1;
                     } else {
-                        const loc = device.iploc.split(',');
+                        const loc = obj.iploc.split(',');
                         if (loc.length < 3) {
                             doIpLocation = 2;
                         } else {
@@ -1920,6 +1920,14 @@ module.exports.CreateMeshAgent = function (parent, db, ws, req, args, domain) {
                     if (!device.wsc) { device.wsc = {}; }
                     if (JSON.stringify(device.wsc) != JSON.stringify(command.wsc)) { /*changes.push('Windows Security Center status');*/ device.wsc = command.wsc; change = 1; log = 1; }
                 }
+                if (command.defender != null) { // Defender For Windows Server
+                    if (!device.defender) { device.defender = {}; }
+                    if (JSON.stringify(device.defender) != JSON.stringify(command.defender)) { /*changes.push('Defender status');*/ device.defender = command.defender; change = 1; log = 1; }
+                }
+                if (command.lastbootuptime != null) { // Last Boot Up Time
+                    if (!device.lastbootuptime) { device.lastbootuptime = ""; }
+                    if (device.lastbootuptime != command.lastbootuptime) { /*changes.push('Last Boot Up Time');*/ device.lastbootuptime = command.lastbootuptime; change = 1; log = 1; }
+                }
 
                 // Push Messaging Token
                 if ((command.pmt != null) && (typeof command.pmt == 'string') && (device.pmt != command.pmt)) {
@@ -1935,6 +1943,9 @@ module.exports.CreateMeshAgent = function (parent, db, ws, req, args, domain) {
                     if (device.host != obj.remoteaddr) { device.host = obj.remoteaddr; change = 1; changes.push('host'); }
                     // TODO: Check that the agent has an interface that is the same as the one we got this websocket connection on. Only set if we have a match.
                 }
+
+                // Remove old volumes and BitLocker data, this is part of sysinfo.
+                delete device.volumes;
 
                 // If there are changes, event the new device
                 if (change == 1) {

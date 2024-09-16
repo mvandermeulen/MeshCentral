@@ -364,7 +364,7 @@ module.exports.pluginHandler = function (parent) {
                 if (force_url != null) dl_url = force_url;
                 var url = require('url');
                 var q = url.parse(dl_url, true);
-                var http = (q.protocol == "http") ? require('http') : require('https');
+                var http = (q.protocol == "http:") ? require('http') : require('https');
                 var opts = {
                     path: q.pathname,
                     host: q.hostname,
@@ -409,7 +409,13 @@ module.exports.pluginHandler = function (parent) {
                                         zipfile.openReadStream(entry, function (err, readStream) {
                                             if (err) throw err;
                                             readStream.on('end', function () { zipfile.readEntry(); });
-                                            readStream.pipe(obj.fs.createWriteStream(filePath));
+                                            if (process.platform == 'win32') {
+                                                readStream.pipe(obj.fs.createWriteStream(filePath));
+                                            } else {
+                                                var fileMode = (entry.externalFileAttributes >> 16) & 0x0fff;
+                                                if( fileMode <= 0 ) fileMode = 0o644;
+                                                readStream.pipe(obj.fs.createWriteStream(filePath, { mode: fileMode }));
+                                            }
                                         });
                                     }
                                 });
@@ -451,7 +457,7 @@ module.exports.pluginHandler = function (parent) {
                 if (plugin.versionHistoryUrl == null) reject("No version history available for this plugin.");
                 var url = require('url');
                 var q = url.parse(plugin.versionHistoryUrl, true);
-                var http = (q.protocol == 'http') ? require('http') : require('https');
+                var http = (q.protocol == 'http:') ? require('http') : require('https');
                 var opts = {
                     path: q.pathname,
                     host: q.hostname,

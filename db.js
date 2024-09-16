@@ -136,7 +136,7 @@ module.exports.CreateDB = function (parent, func) {
         for (var i in parent.config.domains) {
             if (typeof parent.config.domains[i].autoremoveinactivedevices == 'number') {
                 var v = parent.config.domains[i].autoremoveinactivedevices;
-                if ((v > 1) && (v <= 2000)) {
+                if ((v >= 1) && (v <= 2000)) {
                     if (v < minRemoveInactiveDevice) { minRemoveInactiveDevice = v; }
                     removeInactiveDevicesPerDomain[i] = v;
                     minRemoveInactiveDevicesPerDomain[i] = v;
@@ -148,7 +148,7 @@ module.exports.CreateDB = function (parent, func) {
         for (var i in parent.webserver.meshes) {
             if (typeof parent.webserver.meshes[i].expireDevs == 'number') {
                 var v = parent.webserver.meshes[i].expireDevs;
-                if ((v > 1) && (v <= 2000)) {
+                if ((v >= 1) && (v <= 2000)) {
                     if (v < minRemoveInactiveDevice) { minRemoveInactiveDevice = v; }
                     if ((minRemoveInactiveDevicesPerDomain[parent.webserver.meshes[i].domain] == null) || (minRemoveInactiveDevicesPerDomain[parent.webserver.meshes[i].domain] > v)) {
                         minRemoveInactiveDevicesPerDomain[parent.webserver.meshes[i].domain] = v;
@@ -417,14 +417,66 @@ module.exports.CreateDB = function (parent, func) {
     };
 
     // Get encryption key
-    obj.getEncryptDataKey = function (password) {
+    obj.getEncryptDataKey = function (password, salt, iterations) {
         if (typeof password != 'string') return null;
-        return parent.crypto.createHash('sha384').update(password).digest("raw").slice(0, 32);
+        let key;
+        try {
+            key = parent.crypto.pbkdf2Sync(password, salt, iterations, 32, 'sha384');
+        } catch (ex) {
+            // If this previous call fails, it's probably because older pbkdf2 did not specify the hashing function, just use the default.
+            key = parent.crypto.pbkdf2Sync(password, salt, iterations, 32);
+        }
+        return key
     }
 
     // Encrypt data 
     obj.encryptData = function (password, plaintext) {
-        var key = obj.getEncryptDataKey(password);
+        let encryptionVersion = 0x01;
+        let iterations = 100000
+        const iv = parent.crypto.randomBytes(16);
+        var key = obj.getEncryptDataKey(password, iv, iterations);
+        if (key == null) return null;
+        const aes = parent.crypto.createCipheriv('aes-256-gcm', key, iv);
+        var ciphertext = aes.update(plaintext);
+        let versionbuf = Buffer.allocUnsafe(2);
+        versionbuf.writeUInt16BE(encryptionVersion);
+        let iterbuf = Buffer.allocUnsafe(4);
+        iterbuf.writeUInt32BE(iterations);
+        let encryptedBuf = aes.final();
+        ciphertext = Buffer.concat([versionbuf, iterbuf, aes.getAuthTag(), iv, ciphertext, encryptedBuf]);
+        return ciphertext.toString('base64');
+    }
+
+    // Decrypt data 
+    obj.decryptData = function (password, ciphertext) {
+        // Adding an encryption version lets us avoid try catching in the future
+        let ciphertextBytes = Buffer.from(ciphertext, 'base64');
+        let encryptionVersion = ciphertextBytes.readUInt16BE(0);
+        try {
+            switch (encryptionVersion) {
+                case 0x01:
+                    let iterations = ciphertextBytes.readUInt32BE(2);
+                    let authTag = ciphertextBytes.slice(6, 22);
+                    const iv = ciphertextBytes.slice(22, 38);
+                    const data = ciphertextBytes.slice(38);
+                    let key = obj.getEncryptDataKey(password, iv, iterations);
+                    if (key == null) return null;
+                    const aes = parent.crypto.createDecipheriv('aes-256-gcm', key, iv);
+                    aes.setAuthTag(authTag);
+                    let plaintextBytes = Buffer.from(aes.update(data));
+                    plaintextBytes = Buffer.concat([plaintextBytes, aes.final()]);
+                    return plaintextBytes;
+                default:
+                    return obj.oldDecryptData(password, ciphertextBytes);
+            }
+        } catch (ex) { return obj.oldDecryptData(password, ciphertextBytes); }
+    }
+
+    // Encrypt data 
+    // The older encryption system uses CBC without integraty checking.
+    // This method is kept only for testing
+    obj.oldEncryptData = function (password, plaintext) {
+        let key = parent.crypto.createHash('sha384').update(password).digest('raw').slice(0, 32);
         if (key == null) return null;
         const iv = parent.crypto.randomBytes(16);
         const aes = parent.crypto.createCipheriv('aes-256-cbc', key, iv);
@@ -433,16 +485,17 @@ module.exports.CreateDB = function (parent, func) {
         return ciphertext.toString('base64');
     }
 
-    // Decrypt data 
-    obj.decryptData = function (password, ciphertext) {
+    // Decrypt data
+    // The older encryption system uses CBC without integraty checking.
+    // This method is kept only to convert the old encryption to the new one.
+    obj.oldDecryptData = function (password, ciphertextBytes) {
+        if (typeof password != 'string') return null;
         try {
-            var key = obj.getEncryptDataKey(password);
-            if (key == null) return null;
-            const ciphertextBytes = Buffer.from(ciphertext, 'base64');
             const iv = ciphertextBytes.slice(0, 16);
             const data = ciphertextBytes.slice(16);
+            let key = parent.crypto.createHash('sha384').update(password).digest('raw').slice(0, 32);
             const aes = parent.crypto.createDecipheriv('aes-256-cbc', key, iv);
-            var plaintextBytes = Buffer.from(aes.update(data));
+            let plaintextBytes = Buffer.from(aes.update(data));
             plaintextBytes = Buffer.concat([plaintextBytes, aes.final()]);
             return plaintextBytes;
         } catch (ex) { return null; }
@@ -733,22 +786,34 @@ module.exports.CreateDB = function (parent, func) {
         });
     } else if (parent.args.mariadb || parent.args.mysql) {
         var connectinArgs = (parent.args.mariadb) ? parent.args.mariadb : parent.args.mysql;
-        var dbname = (connectinArgs.database != null) ? connectinArgs.database : 'meshcentral';
+        if (typeof connectinArgs == 'string') {
+            const parts = connectinArgs.split(/[:@/]+/);
+            var connectionObject = {
+                "user": parts[1],
+                "password": parts[2],
+                "host": parts[3],
+                "port": parts[4],
+                "database": parts[5]
+            };
+            var dbname = (connectionObject.database != null) ? connectionObject.database : 'meshcentral';
+        } else {
+            var dbname = (connectinArgs.database != null) ? connectinArgs.database : 'meshcentral';
 
-        // Including the db name in the connection obj will cause a connection faliure if it does not exist
-        var connectionObject = Clone(connectinArgs);
-        delete connectionObject.database;
+            // Including the db name in the connection obj will cause a connection faliure if it does not exist
+            var connectionObject = Clone(connectinArgs);
+            delete connectionObject.database;
 
-        try {
-            if (connectinArgs.ssl) {
-                if (connectinArgs.ssl.dontcheckserveridentity == true) { connectionObject.ssl.checkServerIdentity = function (name, cert) { return undefined; } };
-                if (connectinArgs.ssl.cacertpath) { connectionObject.ssl.ca = [require('fs').readFileSync(connectinArgs.ssl.cacertpath, 'utf8')]; }
-                if (connectinArgs.ssl.clientcertpath) { connectionObject.ssl.cert = [require('fs').readFileSync(connectinArgs.ssl.clientcertpath, 'utf8')]; }
-                if (connectinArgs.ssl.clientkeypath) { connectionObject.ssl.key = [require('fs').readFileSync(connectinArgs.ssl.clientkeypath, 'utf8')]; }
+            try {
+                if (connectinArgs.ssl) {
+                    if (connectinArgs.ssl.dontcheckserveridentity == true) { connectionObject.ssl.checkServerIdentity = function (name, cert) { return undefined; } };
+                    if (connectinArgs.ssl.cacertpath) { connectionObject.ssl.ca = [require('fs').readFileSync(connectinArgs.ssl.cacertpath, 'utf8')]; }
+                    if (connectinArgs.ssl.clientcertpath) { connectionObject.ssl.cert = [require('fs').readFileSync(connectinArgs.ssl.clientcertpath, 'utf8')]; }
+                    if (connectinArgs.ssl.clientkeypath) { connectionObject.ssl.key = [require('fs').readFileSync(connectinArgs.ssl.clientkeypath, 'utf8')]; }
+                }
+            } catch (ex) {
+                console.log('Error loading SQL Connector certificate: ' + ex);
+                process.exit();
             }
-        } catch (ex) {
-            console.log('Error loading SQL Connector certificate: ' + ex);
-            process.exit();
         }
 
         if (parent.args.mariadb) {
@@ -768,13 +833,13 @@ module.exports.CreateDB = function (parent, func) {
         } else if (parent.args.mysql) {
             // Use MySQL
             obj.databaseType = 5;
-            var tempDatastore = require('mysql').createPool(connectionObject);
+            var tempDatastore = require('mysql2').createPool(connectionObject);
             tempDatastore.query('CREATE DATABASE IF NOT EXISTS ' + dbname, function (error) {
                 if (error != null) {
                     console.log('Auto-create database failed: ' + error);
                 }
                 connectionObject.database = dbname;
-                Datastore = require('mysql').createPool(connectionObject);
+                Datastore = require('mysql2').createPool(connectionObject);
                 createTablesIfNotExist(dbname);
             });
             setTimeout(function () { tempDatastore.end(); }, 2000);
@@ -785,19 +850,27 @@ module.exports.CreateDB = function (parent, func) {
         var dbname = (connectinArgs.database != null) ? connectinArgs.database : 'meshcentral';
         delete connectinArgs.database;
         obj.databaseType = 6;
-        const pgtools = require('pgtools');
-        pgtools.createdb(connectinArgs, dbname, function (err, res) {
-            const { Pool, Client } = require('pg');
-            connectinArgs.database = dbname;
-            Datastore = new Client(connectinArgs);
-            Datastore.connect();
-            if (err == null) {
-                // Create the tables and indexes
-                postgreSqlCreateTables(func);
-            } else {
-                // Database already existed, perform a test query to see if the main table is present
+        const { Pool, Client } = require('pg');
+        connectinArgs.database = dbname;
+        Datastore = new Client(connectinArgs);
+        Datastore.connect();
+        sqlDbQuery('SELECT 1 FROM pg_database WHERE datname = $1', [dbname], function (dberr, dbdocs) { // check database exists first before creating
+            if (dberr == null) { // database exists now check tables exists
                 sqlDbQuery('SELECT doc FROM main WHERE id = $1', ['DatabaseIdentifier'], function (err, docs) {
                     if (err == null) { setupFunctions(func); } else { postgreSqlCreateTables(func); } // If not present, create the tables and indexes
+                });
+            } else { // If not present, create the tables and indexes
+                const pgtools = require('pgtools');
+                pgtools.createdb(connectinArgs, dbname, function (err, res) {
+                    if (err == null) {
+                        // Create the tables and indexes
+                        postgreSqlCreateTables(func);
+                    } else {
+                        // Database already existed, perform a test query to see if the main table is present
+                        sqlDbQuery('SELECT doc FROM main WHERE id = $1', ['DatabaseIdentifier'], function (err, docs) {
+                            if (err == null) { setupFunctions(func); } else { postgreSqlCreateTables(func); } // If not present, create the tables and indexes
+                        });
+                    }
                 });
             }
         });
@@ -809,7 +882,7 @@ module.exports.CreateDB = function (parent, func) {
         if (global.TextEncoder == null) { global.TextEncoder = require('util').TextEncoder; }
         if (global.TextDecoder == null) { global.TextDecoder = require('util').TextDecoder; }
 
-        require('mongodb').MongoClient.connect(parent.args.mongodb, { useNewUrlParser: true, useUnifiedTopology: true }, function (err, client) {
+        require('mongodb').MongoClient.connect(parent.args.mongodb, { useNewUrlParser: true, useUnifiedTopology: true, enableUtf8Validation: false }, function (err, client) {
             if (err != null) { console.log("Unable to connect to database: " + err); process.exit(); return; }
             Datastore = client;
             parent.debug('db', 'Connected to MongoDB database...');
@@ -1244,7 +1317,11 @@ module.exports.CreateDB = function (parent, func) {
                     var docs = [];
                     for (var i in results) {
                         if (results[i].doc) {
-                            docs.push(JSON.parse(results[i].doc));
+                            if (typeof results[i].doc == 'string') {
+                                docs.push(JSON.parse(results[i].doc));
+                            } else {
+                                docs.push(results[i].doc);
+                            }
                         } else if ((results.length == 1) && (results[i]['COUNT(doc)'] != null)) {
                             // This is a SELECT COUNT() operation
                             docs = results[i]['COUNT(doc)'];
@@ -1256,7 +1333,6 @@ module.exports.CreateDB = function (parent, func) {
         } else if (obj.databaseType == 6) { // Postgres SQL
             Datastore.query(query, args, function (error, results) {
                 if (error != null) {
-                    console.log(query, args, error);
                     if (func) try { func(error); } catch (ex) { console.log('SQLERR4', ex); }
                 } else {
                     var docs = [];
@@ -1312,7 +1388,16 @@ module.exports.CreateDB = function (parent, func) {
                         .catch(function (err) { conn.release(); if (func) { try { func(err); } catch (ex) { console.log(ex); } } });
                 })
                 .catch(function (err) { if (func) { try { func(err); } catch (ex) { console.log(ex); } } });
-        } else if ((obj.databaseType == 5) || (obj.databaseType == 6)) { // MySQL
+        } else if (obj.databaseType == 5) { // MySQL
+            Datastore.getConnection(function(err, connection) {
+                if (err) { if (func) { try { func(err); } catch (ex) { console.log(ex); } } return; }
+                var Promises = [];
+                for (var i in queries) { if (typeof queries[i] == 'string') { Promises.push(connection.promise().query(queries[i])); } else { Promises.push(connection.promise().query(queries[i][0], queries[i][1])); } }
+                Promise.all(Promises)
+                    .then(function (error, results, fields) { connection.release(); if (func) { try { func(error, results); } catch (ex) { console.log(ex); } } })
+                    .catch(function (error, results, fields) { connection.release(); if (func) { try { func(error); } catch (ex) { console.log(ex); } } });
+            });
+        } else if (obj.databaseType == 6) { // Postgres
             var Promises = [];
             for (var i in queries) { if (typeof queries[i] == 'string') { Promises.push(Datastore.query(queries[i])); } else { Promises.push(Datastore.query(queries[i][0], queries[i][1])); } }
             Promise.all(Promises)
@@ -1450,9 +1535,9 @@ module.exports.CreateDB = function (parent, func) {
             obj.SetUser = function (user) { if (user == null) return; if (user.subscriptions != null) { var u = Clone(user); if (u.subscriptions) { delete u.subscriptions; } obj.Set(u); } else { obj.Set(user); } };
             obj.dispose = function () { for (var x in obj) { if (obj[x].close) { obj[x].close(); } delete obj[x]; } };
             obj.getLocalAmtNodes = function (func) {
-                sqlDbQuery('SELECT doc FROM main WHERE (type = \'node\') AND (extraex IS NOT NULL)', null, function (err, docs) {
+                sqlDbQuery('SELECT doc FROM main WHERE (type = \'node\') AND (extraex IS NULL)', null, function (err, docs) {
                     if (docs != null) { for (var i in docs) { if (docs[i].links != null) { docs[i] = common.unEscapeLinksFieldName(docs[i]); } } }
-                    var r = []; if (err == null) { for (var i in docs) { if (docs[i].host != null) { r.push(docs[i]); } } } func(err, r);
+                    var r = []; if (err == null) { for (var i in docs) { if (docs[i].host != null && docs[i].intelamt != null) { r.push(docs[i]); } } } func(err, r);
                 });
             };
             obj.getAmtUuidMeshNode = function (domainid, mtype, uuid, func) {
@@ -1470,36 +1555,102 @@ module.exports.CreateDB = function (parent, func) {
             obj.StoreEvent = function (event, func) {
                 obj.dbCounters.eventsSet++;
                 sqlDbQuery('INSERT INTO events VALUES (NULL, $1, $2, $3, $4, $5, $6) RETURNING id', [event.time, ((typeof event.domain == 'string') ? event.domain : null), event.action, event.nodeid ? event.nodeid : null, event.userid ? event.userid : null, JSON.stringify(event)], function (err, docs) {
-                    if ((err == null) && (docs[0].id)) { for (var i in event.ids) { if (event.ids[i] != '*') { sqlDbQuery('INSERT INTO eventids VALUES ($1, $2)', [docs[0].id, event.ids[i]]); } } }
+                    if(func){ func(); }
+                    if ((err == null) && (docs[0].id)) {
+                        for (var i in event.ids) {
+                            if (event.ids[i] != '*') {
+                                obj.pendingTransfer++;
+                                sqlDbQuery('INSERT INTO eventids VALUES ($1, $2)', [docs[0].id, event.ids[i]], function(){ if(func){ func(); } });
+                            }
+                        }
+                    }
                 });
             };
-            obj.GetEvents = function (ids, domain, func) {
+            obj.GetEvents = function (ids, domain, filter, func) {
+                var query = "SELECT doc FROM events ";
+                var dataarray = [domain];
                 if (ids.indexOf('*') >= 0) {
-                    sqlDbQuery('SELECT doc FROM events WHERE (domain = $1) ORDER BY time DESC', [domain], func);
+                    query = query + "WHERE (domain = $1";
+                    if (filter != null) {
+                        query = query + " AND action = $2";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") ORDER BY time DESC";
                 } else {
-                    sqlDbQuery('SELECT doc FROM events JOIN eventids ON id = fkid WHERE (domain = $1 AND (target IN (' + dbMergeSqlArray(ids) + '))) GROUP BY id ORDER BY time DESC', [domain], func);
+                    query = query + 'JOIN eventids ON id = fkid WHERE (domain = $1 AND (target IN (' + dbMergeSqlArray(ids) + '))';
+                    if (filter != null) {
+                        query = query + " AND action = $2";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") GROUP BY id ORDER BY time DESC ";
                 }
+                sqlDbQuery(query, dataarray, func);
             };
-            obj.GetEventsWithLimit = function (ids, domain, limit, func) {
+            obj.GetEventsWithLimit = function (ids, domain, limit, filter, func) {
+                var query = "SELECT doc FROM events ";
+                var dataarray = [domain];
                 if (ids.indexOf('*') >= 0) {
-                    sqlDbQuery('SELECT doc FROM events WHERE (domain = $1) ORDER BY time DESC LIMIT $2', [domain, limit], func);
+                    query = query + "WHERE (domain = $1";
+                    if (filter != null) {
+                        query = query + " AND action = $2) ORDER BY time DESC LIMIT $3";
+                        dataarray.push(filter);
+                    } else {
+                        query = query + ") ORDER BY time DESC LIMIT $2";
+                    }
                 } else {
-                    sqlDbQuery('SELECT doc FROM events JOIN eventids ON id = fkid WHERE (domain = $1 AND (target IN (' + dbMergeSqlArray(ids) + '))) GROUP BY id ORDER BY time DESC LIMIT $2', [domain, limit], func);
+                    query = query + "JOIN eventids ON id = fkid WHERE (domain = $1 AND (target IN (" + dbMergeSqlArray(ids) + "))";
+                    if (filter != null) {
+                        query = query + " AND action = $2) GROUP BY id ORDER BY time DESC LIMIT $3";
+                        dataarray.push(filter);
+                    } else {
+                        query = query + ") GROUP BY id ORDER BY time DESC LIMIT $2";
+                    }
                 }
+                dataarray.push(limit);
+                sqlDbQuery(query, dataarray, func);                
             };
-            obj.GetUserEvents = function (ids, domain, userid, func) {
+            obj.GetUserEvents = function (ids, domain, userid, filter, func) {
+                var query = "SELECT doc FROM events ";
+                var dataarray = [domain, userid];
                 if (ids.indexOf('*') >= 0) {
-                    sqlDbQuery('SELECT doc FROM events WHERE (domain = $1 AND userid = $2) ORDER BY time DESC', [domain, userid], func);
+                    query = query + "WHERE (domain = $1 AND userid = $2";
+                    if (filter != null) {
+                        query = query + " AND action = $3";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") ORDER BY time DESC";
                 } else {
-                    sqlDbQuery('SELECT doc FROM events JOIN eventids ON id = fkid WHERE (domain = $1 AND userid = $2 AND (target IN (' + dbMergeSqlArray(ids) + '))) GROUP BY id ORDER BY time DESC', [domain, userid], func);
+                    query = query + 'JOIN eventids ON id = fkid WHERE (domain = $1 AND userid = $2 AND (target IN (' + dbMergeSqlArray(ids) + '))';
+                    if (filter != null) {
+                        query = query + " AND action = $3";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") GROUP BY id ORDER BY time DESC";
                 }
+                sqlDbQuery(query, dataarray, func);
             };
-            obj.GetUserEventsWithLimit = function (ids, domain, userid, limit, func) {
+            obj.GetUserEventsWithLimit = function (ids, domain, userid, limit, filter, func) {
+                var query = "SELECT doc FROM events ";
+                var dataarray = [domain, userid];
                 if (ids.indexOf('*') >= 0) {
-                    sqlDbQuery('SELECT doc FROM events WHERE (domain = $1 AND userid = $2) ORDER BY time DESC LIMIT $3', [domain, userid, limit], func);
+                    query = query + "WHERE (domain = $1 AND userid = $2";
+                    if (filter != null) {
+                        query = query + " AND action = $3) ORDER BY time DESC LIMIT $4";
+                        dataarray.push(filter);
+                    } else {
+                        query = query + ") ORDER BY time DESC LIMIT $3";
+                    }
                 } else {
-                    sqlDbQuery('SELECT doc FROM events JOIN eventids ON id = fkid WHERE (domain = $1 AND userid = $2 AND (target IN (' + dbMergeSqlArray(ids) + '))) GROUP BY id ORDER BY time DESC LIMIT $3', [domain, userid, limit], func);
+                    query = query + "JOIN eventids ON id = fkid WHERE (domain = $1 AND userid = $2 AND (target IN (" + dbMergeSqlArray(ids) + "))";
+                    if (filter != null) {
+                        query = query + " AND action = $3) GROUP BY id ORDER BY time DESC LIMIT $4";
+                        dataarray.push(filter);
+                    } else {
+                        query = query + ") GROUP BY id ORDER BY time DESC LIMIT $3";
+                    }
                 }
+                dataarray.push(limit);
+                sqlDbQuery(query, dataarray, func);
             };
             obj.GetEventsTimeRange = function (ids, domain, msgids, start, end, func) {
                 if (ids.indexOf('*') >= 0) {
@@ -1509,8 +1660,30 @@ module.exports.CreateDB = function (parent, func) {
                 }
             };
             //obj.GetUserLoginEvents = function (domain, userid, func) { } // TODO
-            obj.GetNodeEventsWithLimit = function (nodeid, domain, limit, func) { sqlDbQuery('SELECT doc FROM events WHERE (nodeid = $1) AND (domain = $2) ORDER BY time DESC LIMIT $3', [nodeid, domain, limit], func); };
-            obj.GetNodeEventsSelfWithLimit = function (nodeid, domain, userid, limit, func) { sqlDbQuery('SELECT doc FROM events WHERE (nodeid = $1) AND (domain = $2) AND ((userid = $3) OR (userid IS NULL)) ORDER BY time DESC LIMIT $4', [nodeid, domain, userid, limit], func); };
+            obj.GetNodeEventsWithLimit = function (nodeid, domain, limit, filter, func) {
+                var query = "SELECT doc FROM events WHERE (nodeid = $1 AND domain = $2";
+                var dataarray = [nodeid, domain];
+                if (filter != null) {
+                    query = query + "AND action = $3) ORDER BY time DESC LIMIT $4";
+                    dataarray.push(filter);
+                } else {
+                    query = query + ") ORDER BY time DESC LIMIT $3";
+                }
+                dataarray.push(limit);
+                sqlDbQuery(query, dataarray, func);
+            };
+            obj.GetNodeEventsSelfWithLimit = function (nodeid, domain, userid, limit, filter, func) {
+                var query = "SELECT doc FROM events WHERE (nodeid = $1) AND (domain = $2) AND ((userid = $3) OR (userid IS NULL)) ";
+                var dataarray = [nodeid, domain, userid];
+                if (filter != null) {
+                    query = query + "AND (action = $4) ORDER BY time DESC LIMIT $5";
+                    dataarray.push(filter);
+                } else {
+                    query = query + "ORDER BY time DESC LIMIT $4";
+                }
+                dataarray.push(limit);
+                sqlDbQuery(query, dataarray, func);
+            };
             obj.RemoveAllEvents = function (domain) { sqlDbQuery('DELETE FROM events', null, function (err, docs) { }); };
             obj.RemoveAllNodeEvents = function (domain, nodeid) { if ((domain == null) || (nodeid == null)) return; sqlDbQuery('DELETE FROM events WHERE domain = $1 AND nodeid = $2', [domain, nodeid], function (err, docs) { }); };
             obj.RemoveAllUserEvents = function (domain, userid) { if ((domain == null) || (userid == null)) return; sqlDbQuery('DELETE FROM events WHERE domain = $1 AND userid = $2', [domain, userid], function (err, docs) { }); };
@@ -1553,12 +1726,12 @@ module.exports.CreateDB = function (parent, func) {
 
             // Plugin operations
             if (obj.pluginsActive) {
-                obj.addPlugin = function (plugin, func) { sqlDbQuery('INSERT INTO plugin VALUES (NULL, $1)', [JSON.stringify(value)], func); }; // Add a plugin
-                obj.getPlugins = function (func) { sqlDbQuery('SELECT doc FROM plugin', null, func); }; // Get all plugins
-                obj.getPlugin = function (id, func) { sqlDbQuery('SELECT doc FROM plugin WHERE id = $1', [id], func); }; // Get plugin
+                obj.addPlugin = function (plugin, func) { sqlDbQuery('INSERT INTO plugin VALUES (NULL, $1)', [JSON.stringify(plugin)], func); }; // Add a plugin
+                obj.getPlugins = function (func) { sqlDbQuery('SELECT JSON_INSERT(doc, "$._id", id) as doc FROM plugin', null, func); }; // Get all plugins
+                obj.getPlugin = function (id, func) { sqlDbQuery('SELECT JSON_INSERT(doc, "$._id", id) as doc FROM plugin WHERE id = $1', [id], func); }; // Get plugin
                 obj.deletePlugin = function (id, func) { sqlDbQuery('DELETE FROM plugin WHERE id = $1', [id], func); }; // Delete plugin
-                obj.setPluginStatus = function (id, status, func) { obj.getPlugin(id, function (err, docs) { if ((err == null) && (docs.length == 1)) { docs[0].status = status; obj.updatePlugin(id, docs[0], func); } }); };
-                obj.updatePlugin = function (id, args, func) { delete args._id; sqlDbQuery('INSERT INTO plugin VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET doc = $2', [id, JSON.stringify(args)], func); };
+                obj.setPluginStatus = function (id, status, func) { sqlDbQuery('UPDATE plugin SET doc=JSON_SET(doc,"$.status",$1) WHERE id=$2', [status,id], func); };
+                obj.updatePlugin = function (id, args, func) { delete args._id; sqlDbQuery('UPDATE plugin SET doc=json_patch(doc,$1) WHERE id=$2', [JSON.stringify(args),id], func); };
             }
         } else if (obj.databaseType == 7) {
             // Database actions on the main collection. AceBase: https://github.com/appy-one/acebase
@@ -1648,42 +1821,78 @@ module.exports.CreateDB = function (parent, func) {
                 obj.dbCounters.eventsSet++;
                 obj.file.ref('events').push(event).then(function (userRef) { if (func) { func(); } });
             };
-            obj.GetEvents = function (ids, domain, func) {
+            obj.GetEvents = function (ids, domain, filter, func) {
                 // This request is slow since we have not found a .filter() that will take two arrays and match a single item.
-                obj.file.query('events').filter('domain', '==', domain).sort('time', false).get({ exclude: ['_id', 'domain', 'node', 'type'] }, function (snapshots) {
-                    const docs = [];
-                    for (var i in snapshots) {
-                        const doc = snapshots[i].val();
-                        if ((doc.ids == null) || (!Array.isArray(doc.ids))) continue;
-                        var found = false;
-                        for (var j in doc.ids) { if (ids.indexOf(doc.ids[j]) >= 0) { found = true; } } // Check if one of the items in both arrays matches
-                        if (found) { delete doc.ids; if (typeof doc.account == 'object') { doc.account = common.aceUnEscapeFieldNames(doc.account); } docs.push(doc); }
-                    }
-                    func(null, docs);
-                });
+                if (filter != null) {
+                    obj.file.query('events').filter('domain', '==', domain).filter('action', '==', filter).sort('time', false).get({ exclude: ['_id', 'domain', 'node', 'type'] }, function (snapshots) {
+                        const docs = [];
+                        for (var i in snapshots) {
+                            const doc = snapshots[i].val();
+                            if ((doc.ids == null) || (!Array.isArray(doc.ids))) continue;
+                            var found = false;
+                            for (var j in doc.ids) { if (ids.indexOf(doc.ids[j]) >= 0) { found = true; } } // Check if one of the items in both arrays matches
+                            if (found) { delete doc.ids; if (typeof doc.account == 'object') { doc.account = common.aceUnEscapeFieldNames(doc.account); } docs.push(doc); }
+                        }
+                        func(null, docs);
+                    });
+                } else {
+                    obj.file.query('events').filter('domain', '==', domain).sort('time', false).get({ exclude: ['_id', 'domain', 'node', 'type'] }, function (snapshots) {
+                        const docs = [];
+                        for (var i in snapshots) {
+                            const doc = snapshots[i].val();
+                            if ((doc.ids == null) || (!Array.isArray(doc.ids))) continue;
+                            var found = false;
+                            for (var j in doc.ids) { if (ids.indexOf(doc.ids[j]) >= 0) { found = true; } } // Check if one of the items in both arrays matches
+                            if (found) { delete doc.ids; if (typeof doc.account == 'object') { doc.account = common.aceUnEscapeFieldNames(doc.account); } docs.push(doc); }
+                        }
+                        func(null, docs);
+                    });
+                }
             };
-            obj.GetEventsWithLimit = function (ids, domain, limit, func) {
+            obj.GetEventsWithLimit = function (ids, domain, limit, filter, func) {
                 // This request is slow since we have not found a .filter() that will take two arrays and match a single item.
                 // TODO: Request a new AceBase feature for a 'array:contains-one-of' filter:
                 // obj.file.indexes.create('events', 'ids', { type: 'array' });
                 // db.query('events').filter('ids', 'array:contains-one-of', ids)
-                obj.file.query('events').filter('domain', '==', domain).take(limit).sort('time', false).get({ exclude: ['_id', 'domain', 'node', 'type'] }, function (snapshots) {
-                    const docs = [];
-                    for (var i in snapshots) {
-                        const doc = snapshots[i].val();
-                        if ((doc.ids == null) || (!Array.isArray(doc.ids))) continue;
-                        var found = false;
-                        for (var j in doc.ids) { if (ids.indexOf(doc.ids[j]) >= 0) { found = true; } } // Check if one of the items in both arrays matches
-                        if (found) { delete doc.ids; if (typeof doc.account == 'object') { doc.account = common.aceUnEscapeFieldNames(doc.account); } docs.push(doc); }
-                    }
-                    func(null, docs);
-                });
+                if (filter != null) {
+                    obj.file.query('events').filter('domain', '==', domain).filter('action', '==', filter).take(limit).sort('time', false).get({ exclude: ['_id', 'domain', 'node', 'type'] }, function (snapshots) {
+                        const docs = [];
+                        for (var i in snapshots) {
+                            const doc = snapshots[i].val();
+                            if ((doc.ids == null) || (!Array.isArray(doc.ids))) continue;
+                            var found = false;
+                            for (var j in doc.ids) { if (ids.indexOf(doc.ids[j]) >= 0) { found = true; } } // Check if one of the items in both arrays matches
+                            if (found) { delete doc.ids; if (typeof doc.account == 'object') { doc.account = common.aceUnEscapeFieldNames(doc.account); } docs.push(doc); }
+                        }
+                        func(null, docs);
+                    });
+                } else {
+                    obj.file.query('events').filter('domain', '==', domain).take(limit).sort('time', false).get({ exclude: ['_id', 'domain', 'node', 'type'] }, function (snapshots) {
+                        const docs = [];
+                        for (var i in snapshots) {
+                            const doc = snapshots[i].val();
+                            if ((doc.ids == null) || (!Array.isArray(doc.ids))) continue;
+                            var found = false;
+                            for (var j in doc.ids) { if (ids.indexOf(doc.ids[j]) >= 0) { found = true; } } // Check if one of the items in both arrays matches
+                            if (found) { delete doc.ids; if (typeof doc.account == 'object') { doc.account = common.aceUnEscapeFieldNames(doc.account); } docs.push(doc); }
+                        }
+                        func(null, docs);
+                    });
+                }
             };
-            obj.GetUserEvents = function (ids, domain, userid, func) {
-                obj.file.query('events').filter('domain', '==', domain).filter('userid', 'in', userid).filter('ids', 'in', ids).sort('time', false).get({ exclude: ['_id', 'domain', 'node', 'type', 'ids'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
+            obj.GetUserEvents = function (ids, domain, userid, filter, func) {
+                if (filter != null) {
+                    obj.file.query('events').filter('domain', '==', domain).filter('userid', 'in', userid).filter('ids', 'in', ids).filter('action', '==', filter).sort('time', false).get({ exclude: ['_id', 'domain', 'node', 'type', 'ids'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
+                } else {
+                    obj.file.query('events').filter('domain', '==', domain).filter('userid', 'in', userid).filter('ids', 'in', ids).sort('time', false).get({ exclude: ['_id', 'domain', 'node', 'type', 'ids'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
+                }
             };
-            obj.GetUserEventsWithLimit = function (ids, domain, userid, limit, func) {
-                obj.file.query('events').take(limit).filter('domain', '==', domain).filter('userid', 'in', userid).filter('ids', 'in', ids).sort('time', false).get({ exclude: ['_id', 'domain', 'node', 'type', 'ids'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
+            obj.GetUserEventsWithLimit = function (ids, domain, userid, limit, filter, func) {
+                if (filter != null) {
+                    obj.file.query('events').take(limit).filter('domain', '==', domain).filter('userid', 'in', userid).filter('ids', 'in', ids).filter('action', '==', filter).sort('time', false).get({ exclude: ['_id', 'domain', 'node', 'type', 'ids'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
+                } else {
+                    obj.file.query('events').take(limit).filter('domain', '==', domain).filter('userid', 'in', userid).filter('ids', 'in', ids).sort('time', false).get({ exclude: ['_id', 'domain', 'node', 'type', 'ids'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
+                }
             };
             obj.GetEventsTimeRange = function (ids, domain, msgids, start, end, func) {
                 obj.file.query('events').filter('domain', '==', domain).filter('ids', 'in', ids).filter('msgid', 'in', msgids).filter('time', 'between', [start, end]).sort('time', false).get({ exclude: ['type', '_id', 'domain', 'node'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
@@ -1691,10 +1900,19 @@ module.exports.CreateDB = function (parent, func) {
             obj.GetUserLoginEvents = function (domain, userid, func) {
                 obj.file.query('events').filter('domain', '==', domain).filter('action', 'in', ['authfail', 'login']).filter('userid', '==', userid).filter('msgArgs', 'exists').sort('time', false).get({ include: ['action', 'time', 'msgid', 'msgArgs', 'tokenName'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
             };
-            obj.GetNodeEventsWithLimit = function (nodeid, domain, limit, func) {
-                obj.file.query('events').take(limit).filter('domain', '==', domain).filter('nodeid', '==', nodeid).sort('time', false).get({ exclude: ['type', 'etype', '_id', 'domain', 'ids', 'node', 'nodeid'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
+            obj.GetNodeEventsWithLimit = function (nodeid, domain, limit, filter, func) {
+                if (filter != null) {
+                    obj.file.query('events').take(limit).filter('domain', '==', domain).filter('nodeid', '==', nodeid).filter('action', '==', filter).sort('time', false).get({ exclude: ['type', 'etype', '_id', 'domain', 'ids', 'node', 'nodeid'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
+                } else {
+                    obj.file.query('events').take(limit).filter('domain', '==', domain).filter('nodeid', '==', nodeid).sort('time', false).get({ exclude: ['type', 'etype', '_id', 'domain', 'ids', 'node', 'nodeid'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
+                }
             };
-            obj.GetNodeEventsSelfWithLimit = function (nodeid, domain, userid, limit, func) {
+            obj.GetNodeEventsSelfWithLimit = function (nodeid, domain, userid, limit, filter, func) {
+                if (filter != null) {
+                    obj.file.query('events').take(limit).filter('domain', '==', domain).filter('nodeid', '==', nodeid).filter('userid', '==', userid).filter('action', '==', filter).sort('time', false).get({ exclude: ['type', 'etype', '_id', 'domain', 'ids', 'node', 'nodeid'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
+                } else {
+                    obj.file.query('events').take(limit).filter('domain', '==', domain).filter('nodeid', '==', nodeid).filter('userid', '==', userid).sort('time', false).get({ exclude: ['type', 'etype', '_id', 'domain', 'ids', 'node', 'nodeid'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
+                }
                 obj.file.query('events').take(limit).filter('domain', '==', domain).filter('nodeid', '==', nodeid).filter('userid', '==', userid).sort('time', false).get({ exclude: ['type', 'etype', '_id', 'domain', 'ids', 'node', 'nodeid'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
             };
             obj.RemoveAllEvents = function (domain) {
@@ -1873,7 +2091,7 @@ module.exports.CreateDB = function (parent, func) {
             obj.DeleteDomain = function (domain, func) { sqlDbQuery('DELETE FROM main WHERE domain = $1', [domain], func); };
             obj.SetUser = function (user) { if (user == null) return; if (user.subscriptions != null) { var u = Clone(user); if (u.subscriptions) { delete u.subscriptions; } obj.Set(u); } else { obj.Set(user); } };
             obj.dispose = function () { for (var x in obj) { if (obj[x].close) { obj[x].close(); } delete obj[x]; } };
-            obj.getLocalAmtNodes = function (func) { sqlDbQuery('SELECT doc FROM main WHERE (type = \'node\') AND (extraex IS NOT NULL)', null, function (err, docs) { var r = []; if (err == null) { for (var i in docs) { if (docs[i].host != null) { r.push(docs[i]); } } } func(err, r); }); };
+            obj.getLocalAmtNodes = function (func) { sqlDbQuery('SELECT doc FROM main WHERE (type = \'node\') AND (extraex IS NULL)', null, function (err, docs) { var r = []; if (err == null) { for (var i in docs) { if (docs[i].host != null && docs[i].intelamt != null) { r.push(docs[i]); } } } func(err, r); }); };
             obj.getAmtUuidMeshNode = function (domainid, mtype, uuid, func) { sqlDbQuery('SELECT doc FROM main WHERE domain = $1 AND extraex = $2', [domainid, 'uuid/' + uuid], func); };
             obj.isMaxType = function (max, type, domainid, func) { if (max == null) { func(false); } else { sqlDbExec('SELECT COUNT(id) FROM main WHERE domain = $1 AND type = $2', [domainid, type], function (err, response) { func((response['COUNT(id)'] == null) || (response['COUNT(id)'] > max), response['COUNT(id)']) }); } }
 
@@ -1882,36 +2100,109 @@ module.exports.CreateDB = function (parent, func) {
             obj.StoreEvent = function (event, func) {
                 obj.dbCounters.eventsSet++;
                 sqlDbQuery('INSERT INTO events VALUES (DEFAULT, $1, $2, $3, $4, $5, $6) RETURNING id', [event.time, ((typeof event.domain == 'string') ? event.domain : null), event.action, event.nodeid ? event.nodeid : null, event.userid ? event.userid : null, event], function (err, docs) {
-                    if (docs.id) { for (var i in event.ids) { if (event.ids[i] != '*') { sqlDbQuery('INSERT INTO eventids VALUES ($1, $2)', [docs.id, event.ids[i]]); } } }
+                    if(func){ func(); }
+                    if (docs.id) {
+                        for (var i in event.ids) {
+                            if (event.ids[i] != '*') {
+                                obj.pendingTransfer++;
+                                sqlDbQuery('INSERT INTO eventids VALUES ($1, $2)', [docs.id, event.ids[i]], function(){ if(func){ func(); } });
+                            }
+                        }
+                    }
                 });
             };
-            obj.GetEvents = function (ids, domain, func) {
+            obj.GetEvents = function (ids, domain, filter, func) {
+                var query = "SELECT doc FROM events ";
+                var dataarray = [domain]; 
                 if (ids.indexOf('*') >= 0) {
-                    sqlDbQuery('SELECT doc FROM events WHERE (domain = $1) ORDER BY time DESC', [domain], func);
+                    query = query + "WHERE (domain = $1";
+                    if (filter != null) {
+                        query = query + " AND action = $2";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") ORDER BY time DESC";
                 } else {
-                    sqlDbQuery('SELECT doc FROM events JOIN eventids ON id = fkid WHERE (domain = $1 AND (target = ANY ($2))) GROUP BY id ORDER BY time DESC', [domain, ids], func);
+                    query = query + "JOIN eventids ON id = fkid WHERE (domain = $1 AND (target = ANY ($2))";
+                    dataarray.push(ids);
+                    if (filter != null) {
+                        query = query + " AND action = $3";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") GROUP BY id ORDER BY time DESC";
                 }
+                sqlDbQuery(query, dataarray, func);
             };
-            obj.GetEventsWithLimit = function (ids, domain, limit, func) {
+            obj.GetEventsWithLimit = function (ids, domain, limit, filter, func) {
+                var query = "SELECT doc FROM events ";
+                var dataarray = [domain];
                 if (ids.indexOf('*') >= 0) {
-                    sqlDbQuery('SELECT doc FROM events WHERE (domain = $1) ORDER BY time DESC LIMIT $2', [domain, limit], func);
+                    query = query + "WHERE (domain = $1";
+                    if (filter != null) {
+                        query = query + " AND action = $2) ORDER BY time DESC LIMIT $3";
+                        dataarray.push(filter);
+                    } else {
+                        query = query + ") ORDER BY time DESC LIMIT $2";
+                    }
                 } else {
-                    sqlDbQuery('SELECT doc FROM events JOIN eventids ON id = fkid WHERE (domain = $1 AND (target = ANY ($2))) GROUP BY id ORDER BY time DESC LIMIT $3', [domain, ids, limit], func);
+                    if (ids.length == 0) { ids = ''; } // MySQL can't handle a query with IN() on an empty array, we have to use an empty string instead.
+                    query = query + "JOIN eventids ON id = fkid WHERE (domain = $1 AND (target = ANY ($2))";
+                    dataarray.push(ids);
+                    if (filter != null) {
+                        query = query + " AND action = $3) ORDER BY time DESC LIMIT $4";
+                        dataarray.push(filter);
+                    } else {
+                        query = query + ") ORDER BY time DESC LIMIT $3";
+                    }
                 }
+                dataarray.push(limit);
+                sqlDbQuery(query, dataarray, func);
             };
-            obj.GetUserEvents = function (ids, domain, userid, func) {
+            obj.GetUserEvents = function (ids, domain, userid, filter, func) {
+                var query = "SELECT doc FROM events ";
+                var dataarray = [domain, userid];
                 if (ids.indexOf('*') >= 0) {
-                    sqlDbQuery('SELECT doc FROM events WHERE (domain = $1 AND userid = $2) ORDER BY time DESC', [domain, userid], func);
+                    query = query + "WHERE (domain = $1 AND userid = $2";
+                    if (filter != null) {
+                        query = query + " AND action = $3";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") ORDER BY time DESC";
                 } else {
-                    sqlDbQuery('SELECT doc FROM events JOIN eventids ON id = fkid WHERE (domain = $1 AND userid = $2 AND (target = ANY ($3))) GROUP BY id ORDER BY time DESC', [domain, userid, ids], func);
+                    if (ids.length == 0) { ids = ''; } // MySQL can't handle a query with IN() on an empty array, we have to use an empty string instead.
+                    query = query + "JOIN eventids ON id = fkid WHERE (domain = $1 AND userid = $2 AND (target = ANY ($3))";
+                    dataarray.push(ids);
+                    if (filter != null) {
+                        query = query + " AND action = $4";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") GROUP BY id ORDER BY time DESC";
                 }
+                sqlDbQuery(query, dataarray, func);
             };
-            obj.GetUserEventsWithLimit = function (ids, domain, userid, limit, func) {
+            obj.GetUserEventsWithLimit = function (ids, domain, userid, limit, filter, func) {
+                var query = "SELECT doc FROM events ";
+                var dataarray = [domain, userid];
                 if (ids.indexOf('*') >= 0) {
-                    sqlDbQuery('SELECT doc FROM events WHERE (domain = $1 AND userid = $2) ORDER BY time DESC LIMIT $3', [domain, userid, limit], func);
+                    query = query + "WHERE (domain = $1 AND userid = $2";
+                    if (filter != null) {
+                        query = query + " AND action = $3) ORDER BY time DESC LIMIT $4 ";
+                        dataarray.push(filter);
+                    } else {
+                        query = query + ") ORDER BY time DESC LIMIT $3";
+                    }
                 } else {
-                    sqlDbQuery('SELECT doc FROM events JOIN eventids ON id = fkid WHERE (domain = $1 AND userid = $2 AND (target = ANY ($3))) GROUP BY id ORDER BY time DESC LIMIT $4', [domain, userid, ids, limit], func);
+                    if (ids.length == 0) { ids = ''; } // MySQL can't handle a query with IN() on an empty array, we have to use an empty string instead.
+                    query = query + "JOIN eventids ON id = fkid WHERE (domain = $1 AND userid = $2 AND (target = ANY ($3))";
+                    dataarray.push(ids);
+                    if (filter != null) {
+                        query = query + " AND action = $4) GROUP BY id ORDER BY time DESC LIMIT $5";
+                        dataarray.push(filter);
+                    } else {
+                        query = query + ") GROUP BY id ORDER BY time DESC LIMIT $4";
+                    }
                 }
+                dataarray.push(limit);
+                sqlDbQuery(query, dataarray, func);
             };
             obj.GetEventsTimeRange = function (ids, domain, msgids, start, end, func) {
                 if (ids.indexOf('*') >= 0) {
@@ -1921,8 +2212,30 @@ module.exports.CreateDB = function (parent, func) {
                 }
             };
             //obj.GetUserLoginEvents = function (domain, userid, func) { } // TODO
-            obj.GetNodeEventsWithLimit = function (nodeid, domain, limit, func) { sqlDbQuery('SELECT doc FROM events WHERE (nodeid = $1) AND (domain = $2) ORDER BY time DESC LIMIT $3', [nodeid, domain, limit], func); };
-            obj.GetNodeEventsSelfWithLimit = function (nodeid, domain, userid, limit, func) { sqlDbQuery('SELECT doc FROM events WHERE (nodeid = $1) AND (domain = $2) AND ((userid = $3) OR (userid IS NULL)) ORDER BY time DESC LIMIT $4', [nodeid, domain, userid, limit], func); };
+            obj.GetNodeEventsWithLimit = function (nodeid, domain, limit, filter, func) {
+                var query = "SELECT doc FROM events WHERE (nodeid = $1 AND domain = $2";
+                var dataarray = [nodeid, domain];
+                if (filter != null) {
+                    query = query + " AND action = $3) ORDER BY time DESC LIMIT $4";
+                    dataarray.push(filter);
+                } else {
+                    query = query + ") ORDER BY time DESC LIMIT $3";
+                }
+                dataarray.push(limit);
+                sqlDbQuery(query, dataarray, func);
+            };
+            obj.GetNodeEventsSelfWithLimit = function (nodeid, domain, userid, limit, filter, func) {
+                var query = "SELECT doc FROM events WHERE (nodeid = $1 AND domain = $2 AND ((userid = $3) OR (userid IS NULL))";
+                var dataarray = [nodeid, domain, userid];
+                if (filter != null) {
+                    query = query + "  AND action = $4) ORDER BY time DESC LIMIT $5";
+                    dataarray.push(filter);
+                } else {
+                    query = query + ") ORDER BY time DESC LIMIT $4";
+                }
+                dataarray.push(limit);
+                sqlDbQuery(query, dataarray, func);
+            };
             obj.RemoveAllEvents = function (domain) { sqlDbQuery('DELETE FROM events', null, function (err, docs) { }); };
             obj.RemoveAllNodeEvents = function (domain, nodeid) { if ((domain == null) || (nodeid == null)) return; sqlDbQuery('DELETE FROM events WHERE domain = $1 AND nodeid = $2', [domain, nodeid], function (err, docs) { }); };
             obj.RemoveAllUserEvents = function (domain, userid) { if ((domain == null) || (userid == null)) return; sqlDbQuery('DELETE FROM events WHERE domain = $1 AND userid = $2', [domain, userid], function (err, docs) { }); };
@@ -1965,12 +2278,12 @@ module.exports.CreateDB = function (parent, func) {
 
             // Plugin operations
             if (obj.pluginsActive) {
-                obj.addPlugin = function (plugin, func) { sqlDbQuery('INSERT INTO plugin VALUES (DEFAULT, $2)', [value], func); }; // Add a plugin
-                obj.getPlugins = function (func) { sqlDbQuery('SELECT doc FROM plugin', null, func); }; // Get all plugins
-                obj.getPlugin = function (id, func) { sqlDbQuery('SELECT doc FROM plugin WHERE id = $1', [id], func); }; // Get plugin
+                obj.addPlugin = function (plugin, func) { sqlDbQuery('INSERT INTO plugin VALUES (DEFAULT, $1)', [plugin], func); }; // Add a plugin
+                obj.getPlugins = function (func) { sqlDbQuery("SELECT doc::jsonb || ('{\"_id\":' || plugin.id || '}')::jsonb as doc FROM plugin", null, func); }; // Get all plugins
+                obj.getPlugin = function (id, func) { sqlDbQuery("SELECT doc::jsonb || ('{\"_id\":' || plugin.id || '}')::jsonb as  doc FROM plugin WHERE id = $1", [id], func); }; // Get plugin
                 obj.deletePlugin = function (id, func) { sqlDbQuery('DELETE FROM plugin WHERE id = $1', [id], func); }; // Delete plugin
-                obj.setPluginStatus = function (id, status, func) { obj.getPlugin(id, function (err, docs) { if ((err == null) && (docs.length == 1)) { docs[0].status = status; obj.updatePlugin(id, docs[0], func); } }); };
-                obj.updatePlugin = function (id, args, func) { delete args._id; sqlDbQuery('INSERT INTO plugin VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET doc = $2', [id, args], func); };
+                obj.setPluginStatus = function (id, status, func) { sqlDbQuery("UPDATE plugin SET doc= jsonb_set(doc::jsonb,'{status}',$1) WHERE id=$2", [status,id], func); };
+                obj.updatePlugin = function (id, args, func) { delete args._id; sqlDbQuery('UPDATE plugin SET doc= doc::jsonb || ($1) WHERE id=$2', [args,id], func); };
             }
         } else if ((obj.databaseType == 4) || (obj.databaseType == 5)) {
             // Database actions on the main collection (MariaDB or MySQL)
@@ -2038,7 +2351,7 @@ module.exports.CreateDB = function (parent, func) {
             obj.DeleteDomain = function (domain, func) { sqlDbQuery('DELETE FROM main WHERE domain = ?', [domain], func); };
             obj.SetUser = function (user) { if (user == null) return; if (user.subscriptions != null) { var u = Clone(user); if (u.subscriptions) { delete u.subscriptions; } obj.Set(u); } else { obj.Set(user); } };
             obj.dispose = function () { for (var x in obj) { if (obj[x].close) { obj[x].close(); } delete obj[x]; } };
-            obj.getLocalAmtNodes = function (func) { sqlDbQuery('SELECT doc FROM main WHERE (type = "node") AND (extraex IS NOT NULL)', null, function (err, docs) { var r = []; if (err == null) { for (var i in docs) { if (docs[i].host != null) { r.push(docs[i]); } } } func(err, r); }); };
+            obj.getLocalAmtNodes = function (func) { sqlDbQuery('SELECT doc FROM main WHERE (type = "node") AND (extraex IS NULL)', null, function (err, docs) { var r = []; if (err == null) { for (var i in docs) { if (docs[i].host != null && docs[i].intelamt != null) { r.push(docs[i]); } } } func(err, r); }); };
             obj.getAmtUuidMeshNode = function (domainid, mtype, uuid, func) { sqlDbQuery('SELECT doc FROM main WHERE domain = ? AND extraex = ?', [domainid, 'uuid/' + uuid], func); };
             obj.isMaxType = function (max, type, domainid, func) { if (max == null) { func(false); } else { sqlDbExec('SELECT COUNT(id) FROM main WHERE domain = ? AND type = ?', [domainid, type], function (err, response) { func((response['COUNT(id)'] == null) || (response['COUNT(id)'] > max), response['COUNT(id)']) }); } }
 
@@ -2050,37 +2363,95 @@ module.exports.CreateDB = function (parent, func) {
                 for (var i in event.ids) { if (event.ids[i] != '*') { batchQuery.push(['INSERT INTO eventids VALUE (LAST_INSERT_ID(), ?)', [event.ids[i]]]); } }
                 sqlDbBatchExec(batchQuery, function (err, docs) { if (func != null) { func(err, docs); } });
             };
-            obj.GetEvents = function (ids, domain, func) {
+            obj.GetEvents = function (ids, domain, filter, func) {
+                var query = "SELECT doc FROM events ";
+                var dataarray = [domain];
                 if (ids.indexOf('*') >= 0) {
-                    sqlDbQuery('SELECT doc FROM events WHERE (domain = ?) ORDER BY time DESC', [domain], func);
+                    query = query + "WHERE (domain = ?";
+                    if (filter != null) {
+                        query = query + " AND action = ?";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") ORDER BY time DESC";
                 } else {
                     if (ids.length == 0) { ids = ''; } // MySQL can't handle a query with IN() on an empty array, we have to use an empty string instead.
-                    sqlDbQuery('SELECT doc FROM events JOIN eventids ON id = fkid WHERE (domain = ? AND target IN (?)) GROUP BY id ORDER BY time DESC', [domain, ids], func);
+                    query = query + "JOIN eventids ON id = fkid WHERE (domain = ? AND target IN (?)";
+                    dataarray.push(ids);
+                    if (filter != null) {
+                        query = query + " AND action = ?";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") GROUP BY id ORDER BY time DESC";
                 }
+                sqlDbQuery(query, dataarray, func);
             };
-            obj.GetEventsWithLimit = function (ids, domain, limit, func) {
+            obj.GetEventsWithLimit = function (ids, domain, limit, filter, func) {
+                var query = "SELECT doc FROM events ";
+                var dataarray = [domain];
                 if (ids.indexOf('*') >= 0) {
-                    sqlDbQuery('SELECT doc FROM events WHERE (domain = ?) ORDER BY time DESC LIMIT ?', [domain, limit], func);
+                    query = query + "WHERE (domain = ?";
+                    if (filter != null) {
+                        query = query + " AND action = ? ";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") ORDER BY time DESC LIMIT ?";
                 } else {
                     if (ids.length == 0) { ids = ''; } // MySQL can't handle a query with IN() on an empty array, we have to use an empty string instead.
-                    sqlDbQuery('SELECT doc FROM events JOIN eventids ON id = fkid WHERE (domain = ? AND target IN (?)) GROUP BY id ORDER BY time DESC LIMIT ?', [domain, ids, limit], func);
+                    query = query + "JOIN eventids ON id = fkid WHERE (domain = ? AND target IN (?)";
+                    dataarray.push(ids);
+                    if (filter != null) {
+                        query = query + " AND action = ?";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") GROUP BY id ORDER BY time DESC LIMIT ?";
                 }
+                dataarray.push(limit);
+                sqlDbQuery(query, dataarray, func);
             };
-            obj.GetUserEvents = function (ids, domain, userid, func) {
+            obj.GetUserEvents = function (ids, domain, userid, filter, func) {
+                var query = "SELECT doc FROM events ";
+                var dataarray = [domain, userid];
                 if (ids.indexOf('*') >= 0) {
-                    sqlDbQuery('SELECT doc FROM events WHERE (domain = ? AND userid = ?) ORDER BY time DESC', [domain, userid], func);
+                    query = query + "WHERE (domain = ? AND userid = ?";
+                    if (filter != null) {
+                        query = query + " AND action = ?";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") ORDER BY time DESC";
                 } else {
                     if (ids.length == 0) { ids = ''; } // MySQL can't handle a query with IN() on an empty array, we have to use an empty string instead.
-                    sqlDbQuery('SELECT doc FROM events JOIN eventids ON id = fkid WHERE (domain = ? AND userid = ? AND target IN (?)) GROUP BY id ORDER BY time DESC', [domain, userid, ids], func);
+                    query = query + "JOIN eventids ON id = fkid WHERE (domain = ? AND userid = ? AND target IN (?)";
+                    dataarray.push(ids);
+                    if (filter != null) {
+                        query = query + " AND action = ?";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") GROUP BY id ORDER BY time DESC";
                 }
+                sqlDbQuery(query, dataarray, func);
             };
-            obj.GetUserEventsWithLimit = function (ids, domain, userid, limit, func) {
+            obj.GetUserEventsWithLimit = function (ids, domain, userid, limit, filter, func) {
+                var query = "SELECT doc FROM events ";
+                var dataarray = [domain, userid];
                 if (ids.indexOf('*') >= 0) {
-                    sqlDbQuery('SELECT doc FROM events WHERE (domain = ? AND userid = ?) ORDER BY time DESC LIMIT ?', [domain, userid, limit], func);
+                    query = query + "WHERE (domain = ? AND userid = ?";
+                    if (filter != null) {
+                        query = query + " AND action = ?";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") ORDER BY time DESC LIMIT ?";
                 } else {
                     if (ids.length == 0) { ids = ''; } // MySQL can't handle a query with IN() on an empty array, we have to use an empty string instead.
-                    sqlDbQuery('SELECT doc FROM events JOIN eventids ON id = fkid WHERE (domain = ? AND userid = ? AND target IN (?)) GROUP BY id ORDER BY time DESC LIMIT ?', [domain, userid, ids, limit], func);
+                    query = query + "JOIN eventids ON id = fkid WHERE (domain = ? AND userid = ? AND target IN (?)";
+                    dataarray.push(ids);
+                    if (filter != null) {
+                        query = query + " AND action = ?";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") GROUP BY id ORDER BY time DESC LIMIT ?";
                 }
+                dataarray.push(limit);
+                sqlDbQuery(query, dataarray, func);
             };
             obj.GetEventsTimeRange = function (ids, domain, msgids, start, end, func) {
                 if (ids.indexOf('*') >= 0) {
@@ -2091,8 +2462,30 @@ module.exports.CreateDB = function (parent, func) {
                 }
             };
             //obj.GetUserLoginEvents = function (domain, userid, func) { } // TODO
-            obj.GetNodeEventsWithLimit = function (nodeid, domain, limit, func) { sqlDbQuery('SELECT doc FROM events WHERE (nodeid = ?) AND (domain = ?) ORDER BY time DESC LIMIT ?', [nodeid, domain, limit], func); };
-            obj.GetNodeEventsSelfWithLimit = function (nodeid, domain, userid, limit, func) { sqlDbQuery('SELECT doc FROM events WHERE (nodeid = ?) AND (domain = ?) AND ((userid = ?) OR (userid IS NULL)) ORDER BY time DESC LIMIT ?', [nodeid, domain, userid, limit], func); };
+            obj.GetNodeEventsWithLimit = function (nodeid, domain, limit, filter, func) {
+                var query = "SELECT doc FROM events WHERE (nodeid = ? AND domain = ?";
+                var dataarray = [nodeid, domain];
+                if (filter != null) {
+                    query = query + " AND action = ?) ORDER BY time DESC LIMIT ?";
+                    dataarray.push(filter);
+                } else {
+                    query = query + ") ORDER BY time DESC LIMIT ?";
+                }
+                dataarray.push(limit);
+                sqlDbQuery(query, dataarray, func);
+            };
+            obj.GetNodeEventsSelfWithLimit = function (nodeid, domain, userid, limit, filter, func) {
+                var query = "SELECT doc FROM events WHERE (nodeid = ? AND domain = ? AND ((userid = ?) OR (userid IS NULL))";
+                var dataarray = [nodeid, domain, userid];
+                if (filter != null) {
+                    query = query + " AND action = ?) ORDER BY time DESC LIMIT ?";
+                    dataarray.push(filter);
+                } else {
+                    query = query + ") ORDER BY time DESC LIMIT ?";
+                }
+                dataarray.push(limit);
+                sqlDbQuery(query, dataarray, func);
+            };
             obj.RemoveAllEvents = function (domain) { sqlDbQuery('DELETE FROM events', null, function (err, docs) { }); };
             obj.RemoveAllNodeEvents = function (domain, nodeid) { if ((domain == null) || (nodeid == null)) return; sqlDbQuery('DELETE FROM events WHERE domain = ? AND nodeid = ?', [domain, nodeid], function (err, docs) { }); };
             obj.RemoveAllUserEvents = function (domain, userid) { if ((domain == null) || (userid == null)) return; sqlDbQuery('DELETE FROM events WHERE domain = ? AND userid = ?', [domain, userid], function (err, docs) { }); };
@@ -2135,12 +2528,12 @@ module.exports.CreateDB = function (parent, func) {
 
             // Plugin operations
             if (obj.pluginsActive) {
-                obj.addPlugin = function (plugin, func) { sqlDbQuery('INSERT INTO plugin VALUE (?, ?)', [null, JSON.stringify(value)], func); }; // Add a plugin
-                obj.getPlugins = function (func) { sqlDbQuery('SELECT doc FROM plugin', null, func); }; // Get all plugins
-                obj.getPlugin = function (id, func) { sqlDbQuery('SELECT doc FROM plugin WHERE id = ?', [id], func); }; // Get plugin
+                obj.addPlugin = function (plugin, func) { sqlDbQuery('INSERT INTO plugin VALUE (?, ?)', [null, JSON.stringify(plugin)], func); }; // Add a plugin
+                obj.getPlugins = function (func) { sqlDbQuery('SELECT JSON_INSERT(doc, "$._id", id) as doc FROM plugin', null, func); }; // Get all plugins
+                obj.getPlugin = function (id, func) { sqlDbQuery('SELECT JSON_INSERT(doc, "$._id", id) as doc FROM plugin WHERE id = ?', [id], func); }; // Get plugin
                 obj.deletePlugin = function (id, func) { sqlDbQuery('DELETE FROM plugin WHERE id = ?', [id], func); }; // Delete plugin
-                obj.setPluginStatus = function (id, status, func) { obj.getPlugin(id, function (err, docs) { if ((err == null) && (docs.length == 1)) { docs[0].status = status; obj.updatePlugin(id, docs[0], func); } }); };
-                obj.updatePlugin = function (id, args, func) { delete args._id; sqlDbQuery('REPLACE INTO plugin VALUE (?, ?)', [id, JSON.stringify(args)], func); };
+                obj.setPluginStatus = function (id, status, func) { sqlDbQuery('UPDATE meshcentral.plugin SET doc=JSON_SET(doc,"$.status",?) WHERE id=?', [status,id], func); };
+                obj.updatePlugin = function (id, args, func) { delete args._id; sqlDbQuery('UPDATE meshcentral.plugin SET doc=JSON_MERGE_PATCH(doc,?) WHERE id=?', [JSON.stringify(args),id], func); };
             }
         } else if (obj.databaseType == 3) {
             // Database actions on the main collection (MongoDB)
@@ -2327,14 +2720,38 @@ module.exports.CreateDB = function (parent, func) {
                 obj.StoreEvent = function (event, func) { obj.dbCounters.eventsSet++; obj.eventsfile.insertOne(event, func); };
             }
 
-            obj.GetEvents = function (ids, domain, func) { obj.eventsfile.find({ domain: domain, ids: { $in: ids } }).project({ type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).toArray(func); };
-            obj.GetEventsWithLimit = function (ids, domain, limit, func) { obj.eventsfile.find({ domain: domain, ids: { $in: ids } }).project({ type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).limit(limit).toArray(func); };
-            obj.GetUserEvents = function (ids, domain, userid, func) { obj.eventsfile.find({ domain: domain, $or: [{ ids: { $in: ids } }, { userid: userid }] }).project({ type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).toArray(func); };
-            obj.GetUserEventsWithLimit = function (ids, domain, userid, limit, func) { obj.eventsfile.find({ domain: domain, $or: [{ ids: { $in: ids } }, { userid: userid }] }).project({ type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).limit(limit).toArray(func); };
+            obj.GetEvents = function (ids, domain, filter, func) {
+                var finddata = { domain: domain,  ids: { $in: ids } };
+                if (filter != null) finddata.action = filter;
+                obj.eventsfile.find(finddata).project({ type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).toArray(func);
+            };
+            obj.GetEventsWithLimit = function (ids, domain, limit, filter, func) {
+                var finddata = { domain: domain, ids: { $in: ids } };
+                if (filter != null) finddata.action = filter;
+                obj.eventsfile.find(finddata).project({ type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).limit(limit).toArray(func);
+            };
+            obj.GetUserEvents = function (ids, domain, userid, filter, func) {
+                var finddata = { domain: domain, $or: [{ ids: { $in: ids } }, { userid: userid }] };
+                if (filter != null) finddata.action = filter; 
+                obj.eventsfile.find(finddata).project({ type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).toArray(func);
+            };
+            obj.GetUserEventsWithLimit = function (ids, domain, userid, limit, filter, func) {
+                var finddata = { domain: domain, $or: [{ ids: { $in: ids } }, { userid: userid }] };
+                if (filter != null) finddata.action = filter; 
+                obj.eventsfile.find(finddata).project({ type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).limit(limit).toArray(func);
+            };
             obj.GetEventsTimeRange = function (ids, domain, msgids, start, end, func) { obj.eventsfile.find({ domain: domain, $or: [{ ids: { $in: ids } }], msgid: { $in: msgids }, time: { $gte: start, $lte: end } }).project({ type: 0, _id: 0, domain: 0, node: 0 }).sort({ time: 1 }).toArray(func); };
             obj.GetUserLoginEvents = function (domain, userid, func) { obj.eventsfile.find({ domain: domain, action: { $in: ['authfail', 'login'] }, userid: userid, msgArgs: { $exists: true } }).project({ action: 1, time: 1, msgid: 1, msgArgs: 1, tokenName: 1 }).sort({ time: -1 }).toArray(func); };
-            obj.GetNodeEventsWithLimit = function (nodeid, domain, limit, func) { obj.eventsfile.find({ domain: domain, nodeid: nodeid }).project({ type: 0, etype: 0, _id: 0, domain: 0, ids: 0, node: 0, nodeid: 0 }).sort({ time: -1 }).limit(limit).toArray(func); };
-            obj.GetNodeEventsSelfWithLimit = function (nodeid, domain, userid, limit, func) { obj.eventsfile.find({ domain: domain, nodeid: nodeid, userid: { $in: [userid, null] } }).project({ type: 0, etype: 0, _id: 0, domain: 0, ids: 0, node: 0, nodeid: 0 }).sort({ time: -1 }).limit(limit).toArray(func); };
+            obj.GetNodeEventsWithLimit = function (nodeid, domain, limit, filter, func) {
+                var finddata = { domain: domain, nodeid: nodeid };
+                if (filter != null) finddata.action = filter;
+                obj.eventsfile.find(finddata).project({ type: 0, etype: 0, _id: 0, domain: 0, ids: 0, node: 0, nodeid: 0 }).sort({ time: -1 }).limit(limit).toArray(func);
+            };
+            obj.GetNodeEventsSelfWithLimit = function (nodeid, domain, userid, limit, filter, func) {
+                var finddata = { domain: domain, nodeid: nodeid, userid: { $in: [userid, null] } };
+                if (filter != null) finddata.action = filter;
+                obj.eventsfile.find(finddata).project({ type: 0, etype: 0, _id: 0, domain: 0, ids: 0, node: 0, nodeid: 0 }).sort({ time: -1 }).limit(limit).toArray(func);
+            };
             obj.RemoveAllEvents = function (domain) { obj.eventsfile.deleteMany({ domain: domain }, { multi: true }); };
             obj.RemoveAllNodeEvents = function (domain, nodeid) { if ((domain == null) || (nodeid == null)) return; obj.eventsfile.deleteMany({ domain: domain, nodeid: nodeid }, { multi: true }); };
             obj.RemoveAllUserEvents = function (domain, userid) { if ((domain == null) || (userid == null)) return; obj.eventsfile.deleteMany({ domain: domain, userid: userid }, { multi: true }); };
@@ -2499,20 +2916,40 @@ module.exports.CreateDB = function (parent, func) {
             // Database actions on the events collection
             obj.GetAllEvents = function (func) { obj.eventsfile.find({}, func); };
             obj.StoreEvent = function (event, func) { obj.eventsfile.insert(event, func); };
-            obj.GetEvents = function (ids, domain, func) { if (obj.databaseType == 1) { obj.eventsfile.find({ domain: domain, ids: { $in: ids } }, { _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).exec(func); } else { obj.eventsfile.find({ domain: domain, ids: { $in: ids } }, { type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }, func); } };
-            obj.GetEventsWithLimit = function (ids, domain, limit, func) { if (obj.databaseType == 1) { obj.eventsfile.find({ domain: domain, ids: { $in: ids } }, { _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).limit(limit).exec(func); } else { obj.eventsfile.find({ domain: domain, ids: { $in: ids } }, { type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).limit(limit, func); } };
-            obj.GetUserEvents = function (ids, domain, userid, func) {
+            obj.GetEvents = function (ids, domain, filter, func) {
+                var finddata = { domain: domain, ids: { $in: ids } };
+                if (filter != null) finddata.action = filter; 
                 if (obj.databaseType == 1) {
-                    obj.eventsfile.find({ domain: domain, $or: [{ ids: { $in: ids } }, { userid: userid }] }, { type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).exec(func);
+                    obj.eventsfile.find(finddata, { _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).exec(func);
                 } else {
-                    obj.eventsfile.find({ domain: domain, $or: [{ ids: { $in: ids } }, { userid: userid }] }, { type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }, func);
+                    obj.eventsfile.find(finddata, { type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }, func);
                 }
             };
-            obj.GetUserEventsWithLimit = function (ids, domain, userid, limit, func) {
+            obj.GetEventsWithLimit = function (ids, domain, limit, filter, func) {
+                var finddata = { domain: domain, ids: { $in: ids } };
+                if (filter != null) finddata.action = filter; 
                 if (obj.databaseType == 1) {
-                    obj.eventsfile.find({ domain: domain, $or: [{ ids: { $in: ids } }, { userid: userid }] }, { type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).limit(limit).exec(func);
+                    obj.eventsfile.find(finddata, { _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).limit(limit).exec(func);
                 } else {
-                    obj.eventsfile.find({ domain: domain, $or: [{ ids: { $in: ids } }, { userid: userid }] }, { type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).limit(limit, func);
+                    obj.eventsfile.find(finddata, { type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).limit(limit, func);
+                }
+            };
+            obj.GetUserEvents = function (ids, domain, userid, filter, func) {
+                var finddata = { domain: domain, $or: [{ ids: { $in: ids } }, { userid: userid }] };
+                if (filter != null) finddata.action = filter; 
+                if (obj.databaseType == 1) {
+                    obj.eventsfile.find(finddata, { type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).exec(func);
+                } else {
+                    obj.eventsfile.find(finddata, { type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }, func);
+                }
+            };
+            obj.GetUserEventsWithLimit = function (ids, domain, userid, limit, filter, func) {
+                var finddata = { domain: domain, $or: [{ ids: { $in: ids } }, { userid: userid }] };
+                if (filter != null) finddata.action = filter; 
+                if (obj.databaseType == 1) {
+                    obj.eventsfile.find(finddata, { type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).limit(limit).exec(func);
+                } else {
+                    obj.eventsfile.find(finddata, { type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).limit(limit, func);
                 }
             };
             obj.GetEventsTimeRange = function (ids, domain, msgids, start, end, func) {
@@ -2529,8 +2966,24 @@ module.exports.CreateDB = function (parent, func) {
                     obj.eventsfile.find({ domain: domain, action: { $in: ['authfail', 'login'] }, userid: userid, msgArgs: { $exists: true } }, { action: 1, time: 1, msgid: 1, msgArgs: 1, tokenName: 1 }).sort({ time: -1 }, func);
                 }
             };
-            obj.GetNodeEventsWithLimit = function (nodeid, domain, limit, func) { if (obj.databaseType == 1) { obj.eventsfile.find({ domain: domain, nodeid: nodeid }, { type: 0, etype: 0, _id: 0, domain: 0, ids: 0, node: 0, nodeid: 0 }).sort({ time: -1 }).limit(limit).exec(func); } else { obj.eventsfile.find({ domain: domain, nodeid: nodeid }, { type: 0, etype: 0, _id: 0, domain: 0, ids: 0, node: 0, nodeid: 0 }).sort({ time: -1 }).limit(limit, func); } };
-            obj.GetNodeEventsSelfWithLimit = function (nodeid, domain, userid, limit, func) { if (obj.databaseType == 1) { obj.eventsfile.find({ domain: domain, nodeid: nodeid, userid: { $in: [userid, null] } }, { type: 0, etype: 0, _id: 0, domain: 0, ids: 0, node: 0, nodeid: 0 }).sort({ time: -1 }).limit(limit).exec(func); } else { obj.eventsfile.find({ domain: domain, nodeid: nodeid }, { type: 0, etype: 0, _id: 0, domain: 0, ids: 0, node: 0, nodeid: 0 }).sort({ time: -1 }).limit(limit, func); } };
+            obj.GetNodeEventsWithLimit = function (nodeid, domain, limit, filter, func) {
+                var finddata = { domain: domain, nodeid: nodeid };
+                if (filter != null) finddata.action = filter;
+                if (obj.databaseType == 1) {
+                    obj.eventsfile.find(finddata, { type: 0, etype: 0, _id: 0, domain: 0, ids: 0, node: 0, nodeid: 0 }).sort({ time: -1 }).limit(limit).exec(func);
+                } else {
+                    obj.eventsfile.find(finddata, { type: 0, etype: 0, _id: 0, domain: 0, ids: 0, node: 0, nodeid: 0 }).sort({ time: -1 }).limit(limit, func);
+                }
+            };
+            obj.GetNodeEventsSelfWithLimit = function (nodeid, domain, userid, limit, filter, func) {
+                var finddata = { domain: domain, nodeid: nodeid, userid: { $in: [userid, null] } };
+                if (filter != null) finddata.action = filter;
+                if (obj.databaseType == 1) {
+                    obj.eventsfile.find(finddata, { type: 0, etype: 0, _id: 0, domain: 0, ids: 0, node: 0, nodeid: 0 }).sort({ time: -1 }).limit(limit).exec(func);
+                } else {
+                    obj.eventsfile.find(finddata, { type: 0, etype: 0, _id: 0, domain: 0, ids: 0, node: 0, nodeid: 0 }).sort({ time: -1 }).limit(limit, func);
+                }
+            };
             obj.RemoveAllEvents = function (domain) { obj.eventsfile.remove({ domain: domain }, { multi: true }); };
             obj.RemoveAllNodeEvents = function (domain, nodeid) { if ((domain == null) || (nodeid == null)) return; obj.eventsfile.remove({ domain: domain, nodeid: nodeid }, { multi: true }); };
             obj.RemoveAllUserEvents = function (domain, userid) { if ((domain == null) || (userid == null)) return; obj.eventsfile.remove({ domain: domain, userid: userid }, { multi: true }); };
@@ -2639,25 +3092,42 @@ module.exports.CreateDB = function (parent, func) {
             r += 'No Settings/AutoBackup\r\n';
         } else {
             if (parent.config.settings.autobackup.backupintervalhours != null) {
+                r += 'Backup Interval (Hours): ';
                 if (typeof parent.config.settings.autobackup.backupintervalhours != 'number') { r += 'Bad backupintervalhours type\r\n'; }
-                else { r += 'Backup Interval (Hours): ' + parent.config.settings.autobackup.backupintervalhours + '\r\n'; }
+                else { r += parent.config.settings.autobackup.backupintervalhours + '\r\n'; }
             }
             if (parent.config.settings.autobackup.keeplastdaysbackup != null) {
+                r += 'Keep Last Backups (Days): ';
                 if (typeof parent.config.settings.autobackup.keeplastdaysbackup != 'number') { r += 'Bad keeplastdaysbackup type\r\n'; }
-                else { r += 'Keep Last Backups (Days): ' + parent.config.settings.autobackup.keeplastdaysbackup + '\r\n'; }
+                else { r += parent.config.settings.autobackup.keeplastdaysbackup + '\r\n'; }
             }
             if (parent.config.settings.autobackup.zippassword != null) {
-                if (typeof parent.config.settings.autobackup.zippassword != 'string') { r += 'Bad zippassword type\r\n'; }
-                else { r += 'ZIP Password Set\r\n'; }
+                r += 'ZIP Password: ';
+                if (typeof parent.config.settings.autobackup.zippassword != 'string') { r += 'Bad zippassword type, Backups will not be encrypted\r\n'; }
+                else if (parent.config.settings.autobackup.zippassword == "") { r += 'Blank, Backups will not be encrypted\r\n'; }
+                else { r += 'Set\r\n'; }
             }
             if (parent.config.settings.autobackup.mongodumppath != null) {
+                r += 'MongoDump Path: ';
                 if (typeof parent.config.settings.autobackup.mongodumppath != 'string') { r += 'Bad mongodumppath type\r\n'; }
-                else { r += 'MongoDump Path: ' + parent.config.settings.autobackup.mongodumppath + '\r\n'; }
+                else { r += parent.config.settings.autobackup.mongodumppath + '\r\n'; }
             }
             if (parent.config.settings.autobackup.mysqldumppath != null) {
+                r += 'MySqlDump Path: ';
                 if (typeof parent.config.settings.autobackup.mysqldumppath != 'string') { r += 'Bad mysqldump type\r\n'; }
-                else { r += 'MySqlDump Path: ' + parent.config.settings.autobackup.mysqldumppath + '\r\n'; }
+                else { r += parent.config.settings.autobackup.mysqldumppath + '\r\n'; }
             }
+            if (typeof parent.config.settings.autobackup.s3 == 'object') {
+                r += 'S3 Backups: Enabled\r\n';
+            }
+            if (typeof parent.config.settings.autobackup.webdav == 'object') {
+                r += 'WebDAV Backups: Enabled\r\n';
+            }
+            if (typeof parent.config.settings.autobackup.googledrive == 'object') {
+                r += 'Google Drive Backups: Enabled\r\n';
+            }
+
+
         }
 
         return r;
@@ -2923,8 +3393,14 @@ module.exports.CreateDB = function (parent, func) {
                         var output = parent.fs.createWriteStream(newAutoBackupPath + '.zip');
                         var archive = null;
                         if (parent.config.settings.autobackup && (typeof parent.config.settings.autobackup.zippassword == 'string')) {
-                            try { archiver.registerFormat('zip-encrypted', require('archiver-zip-encrypted')); } catch (ex) { }
-                            archive = archiver.create('zip-encrypted', { zlib: { level: 9 }, encryptionMethod: 'aes256', password: parent.config.settings.autobackup.zippassword });
+                            try { 
+                                archiver.registerFormat('zip-encrypted', require('archiver-zip-encrypted'));
+                                archive = archiver.create('zip-encrypted', { zlib: { level: 9 }, encryptionMethod: 'aes256', password: parent.config.settings.autobackup.zippassword });
+                                if (func) { func('Creating encrypted ZIP'); }
+                            } catch (ex) { // registering encryption failed, so create without encryption
+                                archive = archiver('zip', { zlib: { level: 9 } });
+                                if (func) { func('Creating encrypted ZIP failed, so falling back to normal ZIP'); }
+                            }
                         } else {
                             archive = archiver('zip', { zlib: { level: 9 } });
                         }
@@ -2962,8 +3438,14 @@ module.exports.CreateDB = function (parent, func) {
                         var output = parent.fs.createWriteStream(newAutoBackupPath + '.zip');
                         var archive = null;
                         if (parent.config.settings.autobackup && (typeof parent.config.settings.autobackup.zippassword == 'string')) {
-                            try { archiver.registerFormat('zip-encrypted', require('archiver-zip-encrypted')); } catch (ex) { }
-                            archive = archiver.create('zip-encrypted', { zlib: { level: 9 }, encryptionMethod: 'aes256', password: parent.config.settings.autobackup.zippassword });
+                            try { 
+                                archiver.registerFormat('zip-encrypted', require('archiver-zip-encrypted'));
+                                archive = archiver.create('zip-encrypted', { zlib: { level: 9 }, encryptionMethod: 'aes256', password: parent.config.settings.autobackup.zippassword });
+                                if (func) { func('Creating encrypted ZIP'); }
+                            } catch (ex) { // registering encryption failed, so create without encryption
+                                archive = archiver('zip', { zlib: { level: 9 } });
+                                if (func) { func('Creating encrypted ZIP failed, so falling back to normal ZIP'); }
+                            }
                         } else {
                             archive = archiver('zip', { zlib: { level: 9 } });
                         }
@@ -2989,8 +3471,14 @@ module.exports.CreateDB = function (parent, func) {
                 var output = parent.fs.createWriteStream(newAutoBackupPath + '.zip');
                 var archive = null;
                 if (parent.config.settings.autobackup && (typeof parent.config.settings.autobackup.zippassword == 'string')) {
-                    try { archiver.registerFormat('zip-encrypted', require('archiver-zip-encrypted')); } catch (ex) { }
-                    archive = archiver.create('zip-encrypted', { zlib: { level: 9 }, encryptionMethod: 'aes256', password: parent.config.settings.autobackup.zippassword });
+                    try { 
+                        archiver.registerFormat('zip-encrypted', require('archiver-zip-encrypted'));
+                        archive = archiver.create('zip-encrypted', { zlib: { level: 9 }, encryptionMethod: 'aes256', password: parent.config.settings.autobackup.zippassword });
+                        if (func) { func('Creating encrypted ZIP'); }
+                    } catch (ex) { // registering encryption failed, so create without encryption
+                        archive = archiver('zip', { zlib: { level: 9 } });
+                        if (func) { func('Creating encrypted ZIP failed, so falling back to normal ZIP'); }
+                    }
                 } else {
                     archive = archiver('zip', { zlib: { level: 9 } });
                 }
@@ -3064,39 +3552,37 @@ module.exports.CreateDB = function (parent, func) {
 
             // Upload to the WebDAV folder
             function performWebDavUpload(client, filepath) {
-                var fileStream = require('fs').createReadStream(filepath);
-                fileStream.on('close', function () { if (func) { func('WebDAV upload completed'); } })
-                fileStream.on('error', function (err) { if (func) { func('WebDAV (fileUpload) error: ' + err); } })
-                fileStream.pipe(client.createWriteStream('/' + webdavfolderName + '/' + require('path').basename(filepath)));
-                if (func) { func('Uploading using WebDAV...'); }
+                require('fs').stat(filepath, function(err,stat){
+                    var fileStream = require('fs').createReadStream(filepath);
+                    fileStream.on('close', function () { if (func) { func('WebDAV upload completed'); } })
+                    fileStream.on('error', function (err) { if (func) { func('WebDAV (fileUpload) error: ' + err); } })
+                    fileStream.pipe(client.createWriteStream('/' + webdavfolderName + '/' + require('path').basename(filepath), { headers: { "Content-Length": stat.size } }));
+                    if (func) { func('Uploading using WebDAV...'); }
+                });
             }
 
             if (func) { func('Attempting WebDAV upload...'); }
             const { createClient } = require('webdav');
-            const client = createClient(parent.config.settings.autobackup.webdav.url, { username: parent.config.settings.autobackup.webdav.username, password: parent.config.settings.autobackup.webdav.password });
-            var directoryItems = client.getDirectoryContents('/');
-            directoryItems.then(
-                function (files) {
-                    var folderFound = false;
-                    for (var i in files) { if ((files[i].basename == webdavfolderName) && (files[i].type == 'directory')) { folderFound = true; } }
-                    if (folderFound == false) {
-                        client.createDirectory(webdavfolderName).then(function (a) {
-                            if (a.statusText == 'Created') {
-                                if (func) { func('WebDAV folder created'); }
-                                performWebDavUpload(client, filename);
-                            } else {
-                                if (func) { func('WebDAV (createDirectory) status: ' + a.statusText); }
-                            }
-                        }).catch(function (err) {
-                            if (func) { func('WebDAV (createDirectory) error: ' + err); }
-                        });
-                    } else {
-                        performWebDavCleanup(client);
+            const client = createClient(parent.config.settings.autobackup.webdav.url, {
+                username: parent.config.settings.autobackup.webdav.username,
+                password: parent.config.settings.autobackup.webdav.password,
+                maxContentLength: Infinity,
+                maxBodyLength: Infinity
+            });
+            client.exists(webdavfolderName).then(function(a){
+                if(a){
+                    performWebDavCleanup(client);
+                    performWebDavUpload(client, filename);
+                }else{
+                    client.createDirectory(webdavfolderName, {recursive: true}).then(function (a) {
+                        if (func) { func('WebDAV folder created'); }
                         performWebDavUpload(client, filename);
-                    }
+                    }).catch(function (err) {
+                        if (func) { func('WebDAV (createDirectory) error: ' + err); }
+                    });
                 }
-            ).catch(function (err) {
-                if (func) { func('WebDAV (getDirectoryContents) error: ' + err); }
+            }).catch(function (err) {
+                if (func) { func('WebDAV (exists) error: ' + err); }
             });
         }
 
@@ -3177,11 +3663,107 @@ module.exports.CreateDB = function (parent, func) {
                 });
             });
         }
+
+        // S3 Backup
+        if ((typeof parent.config.settings.autobackup == 'object') && (typeof parent.config.settings.autobackup.s3 == 'object')) {
+            var s3folderName = 'MeshCentral-Backups';
+            if (typeof parent.config.settings.autobackup.s3.foldername == 'string') { s3folderName = parent.config.settings.autobackup.s3.foldername; }
+            // Construct the config object
+            var accessKey = parent.config.settings.autobackup.s3.accesskey,
+                secretKey = parent.config.settings.autobackup.s3.secretkey,
+                endpoint = parent.config.settings.autobackup.s3.endpoint ? parent.config.settings.autobackup.s3.endpoint : 's3.amazonaws.com',
+                port = parent.config.settings.autobackup.s3.port ? parent.config.settings.autobackup.s3.port : 443,
+                useSsl = parent.config.settings.autobackup.s3.ssl ? parent.config.settings.autobackup.s3.ssl : true,
+                bucketName = parent.config.settings.autobackup.s3.bucketname,
+                pathPrefix = s3folderName,
+                threshold = parent.config.settings.autobackup.s3.maxfiles ? parent.config.settings.autobackup.s3.maxfiles : 0,
+                fileToUpload = filename;
+            // Create a MinIO client
+            const Minio = require('minio');
+            var minioClient = new Minio.Client({
+                endPoint: endpoint,
+                port: port,
+                useSSL: useSsl,
+                accessKey: accessKey,
+                secretKey: secretKey
+            });
+            // List objects in the specified bucket and path prefix
+            var listObjectsPromise = new Promise(function(resolve, reject) {
+                var items = [];
+                var stream = minioClient.listObjects(bucketName, pathPrefix, true);
+                stream.on('data', function(item) {
+                    if (!item.name.endsWith('/')) { // Exclude directories
+                        items.push(item);
+                    }
+                });
+                stream.on('end', function() {
+                    resolve(items);
+                });
+                stream.on('error', function(err) {
+                    reject(err);
+                });
+            });
+            listObjectsPromise.then(function(objects) {
+                // Count the number of files
+                var fileCount = objects.length;
+                 // Return if no files to carry on uploading
+                if (fileCount === 0) { return Promise.resolve(); }
+                // Sort the files by LastModified date (oldest first)
+                objects.sort(function(a, b) { return new Date(a.lastModified) - new Date(b.lastModified); });
+                // Check if the threshold is zero and return if 
+                if (threshold === 0) { return Promise.resolve(); }
+                // Check if the number of files exceeds the threshold (maxfiles) is 0
+                if (fileCount >= threshold) {
+                    // Calculate how many files need to be deleted to make space for the new file
+                    var filesToDelete = fileCount - threshold + 1; // +1 to make space for the new file
+                    if (func) { func('Deleting ' + filesToDelete + ' older ' + (filesToDelete == 1 ? 'file' : 'files') + ' from S3 ...'); }
+                    // Create an array of promises for deleting files
+                    var deletePromises = objects.slice(0, filesToDelete).map(function(fileToDelete) {
+                        return new Promise(function(resolve, reject) {
+                            minioClient.removeObject(bucketName, fileToDelete.name, function(err) {
+                                if (err) {
+                                    reject(err);
+                                } else {
+                                    if (func) { func('Deleted file: ' + fileToDelete.name + ' from S3'); }
+                                    resolve();
+                                }
+                            });
+                        });
+                    });
+                    // Wait for all deletions to complete
+                    return Promise.all(deletePromises);
+                } else {
+                    return Promise.resolve(); // No deletion needed
+                }
+            }).then(function() {
+                // Determine the upload path by combining the pathPrefix with the filename
+                var fileName = require('path').basename(fileToUpload);
+                var uploadPath = require('path').join(pathPrefix, fileName);
+                // Upload a new file
+                var uploadPromise = new Promise(function(resolve, reject) {
+                    if (func) { func('Uploading file ' + uploadPath + ' to S3'); }
+                    minioClient.fPutObject(bucketName, uploadPath, fileToUpload, function(err, etag) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        if (func) { func('Uploaded file: ' + uploadPath + ' to S3'); }
+                        resolve(etag);
+                    }
+                    });
+                });
+                return uploadPromise;
+            }).catch(function(error) {
+                if (func) { func('Error managing files in S3: ' + error); }
+            });
+        }
     }
 
     // Transfer NeDB data into the current database
     obj.nedbtodb = function (func) {
-        var nedbDatastore = require('nedb');
+        var nedbDatastore = null;
+        try { nedbDatastore = require('@yetzt/nedb'); } catch (ex) { } // This is the NeDB with fixed security dependencies.
+        if (nedbDatastore == null) { nedbDatastore = require('nedb'); } // So not to break any existing installations, if the old NeDB is present, use it.
+
         var datastoreOptions = { filename: parent.getConfigFilePath('meshcentral.db'), autoload: true };
 
         // If a DB encryption key is provided, perform database encryption
@@ -3217,16 +3799,16 @@ module.exports.CreateDB = function (parent, func) {
         var eventRecordsTransferCount = 0;
         var powerRecordsTransferCount = 0;
         var statsRecordsTransferCount = 0;
-        var pendingTransfer = 0;
+        obj.pendingTransfer = 0;
 
         // Transfer the data from main database
         nedbfile.find({}, function (err, docs) {
             if ((err == null) && (docs.length > 0)) {
                 performTypedRecordDecrypt(docs)
                 for (var i in docs) {
-                    pendingTransfer++;
+                    obj.pendingTransfer++;
                     normalRecordsTransferCount++;
-                    obj.Set(common.unEscapeLinksFieldName(docs[i]), function () { pendingTransfer--; });
+                    obj.Set(common.unEscapeLinksFieldName(docs[i]), function () { obj.pendingTransfer--; });
                 }
             }
 
@@ -3234,9 +3816,9 @@ module.exports.CreateDB = function (parent, func) {
             nedbeventsfile.find({}, function (err, docs) {
                 if ((err == null) && (docs.length > 0)) {
                     for (var i in docs) {
-                        pendingTransfer++;
+                        obj.pendingTransfer++;
                         eventRecordsTransferCount++;
-                        obj.StoreEvent(docs[i], function () { pendingTransfer--; });
+                        obj.StoreEvent(docs[i], function () { obj.pendingTransfer--; });
                     }
                 }
 
@@ -3244,9 +3826,9 @@ module.exports.CreateDB = function (parent, func) {
                 nedbpowerfile.find({}, function (err, docs) {
                     if ((err == null) && (docs.length > 0)) {
                         for (var i in docs) {
-                            pendingTransfer++;
+                            obj.pendingTransfer++;
                             powerRecordsTransferCount++;
-                            obj.storePowerEvent(docs[i], null, function () { pendingTransfer--; });
+                            obj.storePowerEvent(docs[i], null, function () { obj.pendingTransfer--; });
                         }
                     }
 
@@ -3254,15 +3836,15 @@ module.exports.CreateDB = function (parent, func) {
                     nedbserverstatsfile.find({}, function (err, docs) {
                         if ((err == null) && (docs.length > 0)) {
                             for (var i in docs) {
-                                pendingTransfer++;
+                                obj.pendingTransfer++;
                                 statsRecordsTransferCount++;
-                                obj.SetServerStats(docs[i], function () { pendingTransfer--; });
+                                obj.SetServerStats(docs[i], function () { obj.pendingTransfer--; });
                             }
                         }
 
                         // Only exit when all the records are stored.
                         setInterval(function () {
-                            if (pendingTransfer == 0) { func("Done. " + normalRecordsTransferCount + " record(s), " + eventRecordsTransferCount + " event(s), " + powerRecordsTransferCount + " power change(s), " + statsRecordsTransferCount + " stat(s)."); }
+                            if (obj.pendingTransfer == 0) { func("Done. " + normalRecordsTransferCount + " record(s), " + eventRecordsTransferCount + " event(s), " + powerRecordsTransferCount + " power change(s), " + statsRecordsTransferCount + " stat(s)."); }
                         }, 200)
                     });
                 });
@@ -3274,6 +3856,7 @@ module.exports.CreateDB = function (parent, func) {
 
     // Called when a node has changed
     function dbNodeChange(nodeChange, added) {
+        if (parent.webserver == null) return;
         common.unEscapeLinksFieldName(nodeChange.fullDocument);
         const node = performTypedRecordDecrypt([nodeChange.fullDocument])[0];
         parent.DispatchEvent(['*', node.meshid], obj, { etype: 'node', action: (added ? 'addnode' : 'changenode'), node: parent.webserver.CloneSafeNode(node), nodeid: node._id, domain: node.domain, nolog: 1 });

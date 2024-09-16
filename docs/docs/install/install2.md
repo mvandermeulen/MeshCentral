@@ -4,6 +4,45 @@
 
 This guide is specifically intended to help users install MeshCentral from start to finish. Once installed, you can take a look at the MeshCentral user’s guide for information on how to configure MeshCentral for your specific use. In this document, we will look at installing MeshCentral on AWS Linux, Raspberry Pi and Ubuntu.
 
+## Docker
+
+<https://github.com/Ylianst/MeshCentral/pkgs/container/meshcentral>
+
+```
+docker pull ghcr.io/ylianst/meshcentral:master
+```
+
+!!!warning
+    Do not use the built in mesh update function. Update docker the docker way.
+
+### Docker Compose
+
+```
+version: '3'
+services:
+  meshcentral:
+    restart: unless-stopped # always restart the container unless you stop it
+    image: ghcr.io/ylianst/meshcentral:1.1.27 # 1.1.27 is a version number OR use master for the master branch of bug fixes
+    ports:
+      - 80:80 # HTTP
+      - 443:443 # HTTPS
+      - 4433:4433 # AMT (Optional)
+    volumes:
+      - data:/opt/meshcentral/meshcentral-data # config.json and other important files live here
+      - user_files:/opt/meshcentral/meshcentral-files # where file uploads for users live
+      - backup:/opt/meshcentral/meshcentral-backups # location for the meshcentral backups - this should be mounted to an external storage
+      - web:/opt/meshcentral/meshcentral-web # location for site customization files
+volumes:
+  data:
+    driver: local
+  user_files:
+    driver: local
+  backup:
+    driver: local
+  web:
+    driver: local
+```
+
 ## Quick Start
 
 For some who want to skip this document entirely, there are quick install scripts that will get a MeshCentral2 instance up and running on Linux in a few minutes. These scripts will pretty much do what this document explains very rapidly. Right now, there are two such scripts available:
@@ -13,7 +52,7 @@ For some who want to skip this document entirely, there are quick install script
 For Amazon EC2 users, that want to manage 100 devices or less. Launch a t3.nano or t3.micro EC2 instance with Amazon Linux 2 with TCP ports 22 (SSH), 80 (HTTP), 443 (HTTPS) and 4433 (CIRA) open. Then login as `ec2-user` and enter the following commands:
 
 ```
-wget http://info.meshcentral.com/scripts/mc-aws-linux2.sh
+wget https://meshcentral.com/scripts/mc-aws-linux2.sh
 chmod 755 mc-aws-linux2.sh
 ./mc-aws-linux2.sh
 ```
@@ -21,7 +60,7 @@ chmod 755 mc-aws-linux2.sh
 This will download the fast install script and once run, will install nodejs, meshcentral, setup systemd and start the server. For a larger instance like a t3.small, t3.medium or larger you can run the following that does the same but also installs MongoDB.
 
 ```
-wget http://info.meshcentral.com/scripts/mc-aws-linux2-mongo.sh
+wget https://meshcentral.com/scripts/mc-aws-linux2-mongo.sh
 chmod 755 mc-aws-linux2-mongo.sh
 ./mc-aws-linux2-mongo.sh
 ```
@@ -33,7 +72,7 @@ After these scripts are run, try accessing the server using a browser. MeshCentr
 For 100 devices or less, launch an instance of Ubuntu 18.04 using a small B1s instance. Set the username to `default` in all lower case and open ports 22, 80, 443 and 3389 using the basic network profile. Then start the instance and run the following lines.
 
 ```
-wget http://info.meshcentral.com/scripts/mc-azure-ubuntu1804.sh
+wget https://meshcentral.com/scripts/mc-azure-ubuntu1804.sh
 chmod 755 mc-azure-ubuntu1804.sh
 ./mc-azure-ubuntu1804.sh
 ```
@@ -884,7 +923,7 @@ The last line will run MeshCentral manually and allow it to install any missing 
 
 ```
 sudo chown -R meshcentral:meshcentral /opt/meshcentral
-sudo chmod 755 –R /opt/meshcentral/meshcentral-*
+sudo chmod -R 755 /opt/meshcentral/meshcentral-*
 ```
 
 To make this work, you will need to make MeshCentral work with MongoDB because the /meshcentral-data folder will be read-only. In addition, MeshCentral will not be able to update itself since the account does not have write access to the /node_modules files, so the update will have to be manual. First used systemctl to stop the MeshCentral server process, than use this:
@@ -901,7 +940,7 @@ This will perform the update to the latest server on NPM and re-set the permissi
 MeshCentral allows users to upload and download files stores in the server’s `meshcentral-files` folder. In an increased security setup, we still want the server to be able to read and write files to this folder and we can allow this with:
 
 ```
-sudo chmod 755 –R /opt/meshcentral/meshcentral-files
+sudo chmod -R 755 /opt/meshcentral/meshcentral-files
 ```
 
 If you plan on using the increased security installation along with MeshCentral built-in Let’s Encrypt support you will need to type the following commands to make the `letsencrypt` folder in `meshcentral-data` writable.
@@ -909,7 +948,7 @@ If you plan on using the increased security installation along with MeshCentral 
 ```
 sudo mkdir /opt/meshcentral/meshcentral-data
 sudo mkdir /opt/meshcentral/meshcentral-data/letsencrypt
-sudo chmod 755 –R /opt/meshcentral/meshcentral-data/letsencrypt
+sudo chmod -R 755 /opt/meshcentral/meshcentral-data/letsencrypt
 ```
 
 This will allow the server to get and periodically update its Let’s Encrypt certificate. If this is not done, the server will generate an `ACCES: permission denied` exception.
